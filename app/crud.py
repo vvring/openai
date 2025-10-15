@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .database import get_connection
 from .models import (
@@ -106,6 +106,28 @@ def _row_to_audit_event(row) -> Dict:
         "metadata": metadata,
         "created_at": row["created_at"],
     }
+
+
+def _validate_pagination(limit: Optional[int], offset: Optional[int]) -> None:
+    if limit is not None and limit <= 0:
+        raise ValidationError("limit must be greater than zero")
+    if offset is not None and offset < 0:
+        raise ValidationError("offset must be greater than or equal to zero")
+
+
+def _apply_pagination(
+    sql: str, params: List[Any], limit: Optional[int], offset: Optional[int]
+) -> Tuple[str, List[Any]]:
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+        if offset is not None:
+            sql += " OFFSET ?"
+            params.append(offset)
+    elif offset is not None:
+        sql += " LIMIT -1 OFFSET ?"
+        params.append(offset)
+    return sql, params
 
 
 def _validate_roles(roles: List[str]) -> None:
@@ -245,9 +267,13 @@ def create_user(
         return _row_to_user(row)
 
 
-def list_users() -> List[Dict]:
+def list_users(*, limit: Optional[int] = None, offset: Optional[int] = None) -> List[Dict]:
+    _validate_pagination(limit, offset)
     with get_connection() as conn:
-        rows = conn.execute("SELECT * FROM users ORDER BY id ASC").fetchall()
+        query = "SELECT * FROM users ORDER BY id ASC"
+        params: List[Any] = []
+        query, params = _apply_pagination(query, params, limit, offset)
+        rows = conn.execute(query, tuple(params)).fetchall()
         return [_row_to_user(row) for row in rows]
 
 
@@ -400,7 +426,10 @@ def list_hosts(
     environment: Optional[str] = None,
     tag: Optional[str] = None,
     search: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
 ) -> List[Dict]:
+    _validate_pagination(limit, offset)
     if protocol is not None and protocol not in SUPPORTED_PROTOCOLS:
         raise ValidationError(f"Unsupported protocol '{protocol}'")
     _validate_environment(environment)
@@ -420,6 +449,10 @@ def list_hosts(
             for host in hosts
             if lowered in host["name"].lower() or lowered in host["hostname"].lower()
         ]
+    if offset:
+        hosts = hosts[offset:]
+    if limit is not None:
+        hosts = hosts[:limit]
     return hosts
 
 
@@ -581,10 +614,17 @@ def authorize_user(
         conn.commit()
 
 
-def list_authorizations(*, user_id: Optional[int] = None, host_id: Optional[int] = None) -> List[Dict]:
+def list_authorizations(
+    *,
+    user_id: Optional[int] = None,
+    host_id: Optional[int] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> List[Dict]:
+    _validate_pagination(limit, offset)
     with get_connection() as conn:
         clauses = []
-        params: List[int] = []
+        params: List[Any] = []
         if user_id is not None:
             clauses.append("user_id = ?")
             params.append(user_id)
@@ -595,7 +635,8 @@ def list_authorizations(*, user_id: Optional[int] = None, host_id: Optional[int]
             query = "SELECT * FROM authorizations WHERE " + " AND ".join(clauses) + " ORDER BY id ASC"
         else:
             query = "SELECT * FROM authorizations ORDER BY id ASC"
-        rows = conn.execute(query, params).fetchall()
+        query, params = _apply_pagination(query, params, limit, offset)
+        rows = conn.execute(query, tuple(params)).fetchall()
         return [_row_to_authorization(row) for row in rows]
 
 
@@ -787,7 +828,10 @@ def list_sessions(
     only_active: Optional[bool] = None,
     started_after: Optional[str] = None,
     started_before: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
 ) -> List[Dict]:
+    _validate_pagination(limit, offset)
     if protocol is not None and protocol not in SUPPORTED_PROTOCOLS:
         raise ValidationError(f"Unsupported protocol '{protocol}'")
     clauses: List[str] = []
@@ -816,7 +860,8 @@ def list_sessions(
         query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY id ASC"
     with get_connection() as conn:
-        rows = conn.execute(query, params).fetchall()
+        query, params = _apply_pagination(query, params, limit, offset)
+        rows = conn.execute(query, tuple(params)).fetchall()
         return [_row_to_session(row) for row in rows]
 
 
@@ -842,7 +887,10 @@ def list_recordings(
     protocol: Optional[str] = None,
     created_after: Optional[str] = None,
     created_before: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
 ) -> List[Dict]:
+    _validate_pagination(limit, offset)
     if protocol is not None and protocol not in SUPPORTED_PROTOCOLS:
         raise ValidationError(f"Unsupported protocol '{protocol}'")
     clauses: List[str] = []
@@ -873,7 +921,8 @@ def list_recordings(
         query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY recordings.id ASC"
     with get_connection() as conn:
-        rows = conn.execute(query, params).fetchall()
+        query, params = _apply_pagination(query, params, limit, offset)
+        rows = conn.execute(query, tuple(params)).fetchall()
         return [_row_to_recording(row) for row in rows]
 
 
@@ -896,7 +945,10 @@ def list_audit_events(
     target_id: Optional[int] = None,
     created_after: Optional[str] = None,
     created_before: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
 ) -> List[Dict]:
+    _validate_pagination(limit, offset)
     clauses: List[str] = []
     params: List[object] = []
     if actor_id is not None:
@@ -922,5 +974,6 @@ def list_audit_events(
         query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY id DESC"
     with get_connection() as conn:
-        rows = conn.execute(query, params).fetchall()
+        query, params = _apply_pagination(query, params, limit, offset)
+        rows = conn.execute(query, tuple(params)).fetchall()
         return [_row_to_audit_event(row) for row in rows]

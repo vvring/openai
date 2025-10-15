@@ -662,6 +662,90 @@ def test_session_filters_and_recording_search():
     assert filtered_recordings[0]["metadata"]["codec"] == "h264"
 
 
+def test_list_endpoints_support_pagination():
+    seed_resp = client.post(
+        "/users",
+        json={
+            "username": "seed-admin",
+            "full_name": "Seed Admin",
+            "email": "seed@example.com",
+            "roles": ["admin"],
+        },
+    )
+    actor_id = seed_resp.json()["id"]
+    for idx in range(1, 5):
+        resp = client.post(
+            "/users",
+            json={
+                "username": f"paginated-user-{idx}",
+                "full_name": f"Paginated User {idx}",
+                "email": f"paginated{idx}@example.com",
+                "roles": ["operator"],
+                "performed_by": actor_id,
+            },
+        )
+        assert resp.status_code == 201
+
+    resp = client.get("/users?limit=2")
+    assert resp.status_code == 200
+    users = resp.json()
+    assert [user["username"] for user in users] == ["seed-admin", "paginated-user-1"]
+
+    resp = client.get("/users?offset=3")
+    assert resp.status_code == 200
+    assert [user["username"] for user in resp.json()] == [
+        "paginated-user-3",
+        "paginated-user-4",
+    ]
+
+    resp = client.get("/users?limit=2&offset=1")
+    assert resp.status_code == 200
+    assert [user["username"] for user in resp.json()] == [
+        "paginated-user-1",
+        "paginated-user-2",
+    ]
+
+    for idx in range(3):
+        resp = client.post(
+            "/hosts",
+            json={
+                "name": f"asset-{idx}",
+                "hostname": f"10.0.1.{idx}",
+                "port": 22,
+                "operating_system": "linux",
+                "protocols": ["ssh"],
+                "tls_enabled": True,
+                "rdp_nla": False,
+                "performed_by": actor_id,
+            },
+        )
+        assert resp.status_code == 201
+
+    resp = client.get("/hosts?limit=1&offset=1")
+    assert resp.status_code == 200
+    hosts = resp.json()
+    assert len(hosts) == 1
+    assert hosts[0]["name"] == "asset-1"
+
+    resp = client.get("/hosts?offset=10")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+    resp = client.get("/hosts?limit=-1")
+    assert resp.status_code == 400
+
+    resp = client.get("/audit-events?limit=1")
+    assert resp.status_code == 200
+    assert len(resp.json()) == 1
+
+    resp = client.get("/audit-events?offset=2")
+    assert resp.status_code == 200
+    assert len(resp.json()) >= 1
+
+    resp = client.get("/audit-events?offset=-5")
+    assert resp.status_code == 400
+
+
 @pytest.fixture(autouse=True, scope='module')
 def cleanup_db():
     yield

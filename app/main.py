@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.6.0")
+app = FastAPI(title="Bastion Management Service", version="0.7.0")
 
 
 def _handle_validation_error(func):
@@ -51,6 +51,20 @@ def _parse_datetime(value: str, field: str) -> str:
     return parsed.isoformat()
 
 
+def _parse_positive_int(value, field: str) -> int:
+    parsed = _parse_int(value, field)
+    if parsed <= 0:
+        raise ValidationError(f"Field '{field}' must be greater than zero")
+    return parsed
+
+
+def _parse_non_negative_int(value, field: str) -> int:
+    parsed = _parse_int(value, field)
+    if parsed < 0:
+        raise ValidationError(f"Field '{field}' must be greater than or equal to zero")
+    return parsed
+
+
 @app.post("/users", status_code=status.HTTP_201_CREATED)
 @_handle_validation_error
 def create_user(payload: Dict) -> Dict:
@@ -68,8 +82,15 @@ def create_user(payload: Dict) -> Dict:
 
 
 @app.get("/users")
-def get_users() -> List[Dict]:
-    return crud.list_users()
+@_handle_validation_error
+def get_users(limit: Optional[str] = None, offset: Optional[str] = None) -> List[Dict]:
+    parsed_limit: Optional[int] = None
+    parsed_offset: Optional[int] = None
+    if limit is not None:
+        parsed_limit = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        parsed_offset = _parse_non_negative_int(offset, "offset")
+    return crud.list_users(limit=parsed_limit, offset=parsed_offset)
 
 
 @app.get("/users/{user_id}")
@@ -133,12 +154,22 @@ def get_hosts(
     environment: Optional[str] = None,
     tag: Optional[str] = None,
     search: Optional[str] = None,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
 ) -> List[Dict]:
+    parsed_limit: Optional[int] = None
+    parsed_offset: Optional[int] = None
+    if limit is not None:
+        parsed_limit = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        parsed_offset = _parse_non_negative_int(offset, "offset")
     return crud.list_hosts(
         protocol=protocol,
         environment=environment,
         tag=tag,
         search=search,
+        limit=parsed_limit,
+        offset=parsed_offset,
     )
 
 
@@ -207,14 +238,30 @@ def assign_authorization(payload: Dict):
 
 @app.get("/authorizations")
 @_handle_validation_error
-def list_authorizations(user_id: Optional[str] = None, host_id: Optional[str] = None) -> List[Dict]:
+def list_authorizations(
+    user_id: Optional[str] = None,
+    host_id: Optional[str] = None,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
+) -> List[Dict]:
     parsed_user: Optional[int] = None
     parsed_host: Optional[int] = None
+    parsed_limit: Optional[int] = None
+    parsed_offset: Optional[int] = None
     if user_id is not None:
         parsed_user = _parse_int(user_id, "user_id")
     if host_id is not None:
         parsed_host = _parse_int(host_id, "host_id")
-    return crud.list_authorizations(user_id=parsed_user, host_id=parsed_host)
+    if limit is not None:
+        parsed_limit = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        parsed_offset = _parse_non_negative_int(offset, "offset")
+    return crud.list_authorizations(
+        user_id=parsed_user,
+        host_id=parsed_host,
+        limit=parsed_limit,
+        offset=parsed_offset,
+    )
 
 
 @app.delete("/authorizations/{authorization_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -252,6 +299,7 @@ def end_session(record_id: str, payload: Dict) -> Dict:
 
 
 @app.get("/sessions")
+@_handle_validation_error
 def list_sessions(
     user_id: Optional[str] = None,
     host_id: Optional[str] = None,
@@ -259,6 +307,8 @@ def list_sessions(
     only_active: Optional[str] = None,
     started_after: Optional[str] = None,
     started_before: Optional[str] = None,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
 ) -> List[Dict]:
     params: Dict[str, object] = {}
     if user_id is not None:
@@ -273,6 +323,10 @@ def list_sessions(
         params["started_after"] = _parse_datetime(started_after, "started_after")
     if started_before is not None:
         params["started_before"] = _parse_datetime(started_before, "started_before")
+    if limit is not None:
+        params["limit"] = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        params["offset"] = _parse_non_negative_int(offset, "offset")
     return crud.list_sessions(**params)
 
 
@@ -291,6 +345,8 @@ def list_recordings(
     protocol: Optional[str] = None,
     created_after: Optional[str] = None,
     created_before: Optional[str] = None,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
 ) -> List[Dict]:
     params: Dict[str, object] = {}
     if session_id is not None:
@@ -305,6 +361,10 @@ def list_recordings(
         params["created_after"] = _parse_datetime(created_after, "created_after")
     if created_before is not None:
         params["created_before"] = _parse_datetime(created_before, "created_before")
+    if limit is not None:
+        params["limit"] = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        params["offset"] = _parse_non_negative_int(offset, "offset")
     return crud.list_recordings(**params)
 
 
@@ -323,6 +383,8 @@ def list_audit_events(
     target_id: Optional[str] = None,
     created_after: Optional[str] = None,
     created_before: Optional[str] = None,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
 ) -> List[Dict]:
     params: Dict[str, object] = {}
     if actor_id is not None:
@@ -337,4 +399,8 @@ def list_audit_events(
         params["created_after"] = _parse_datetime(created_after, "created_after")
     if created_before is not None:
         params["created_before"] = _parse_datetime(created_before, "created_before")
+    if limit is not None:
+        params["limit"] = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        params["offset"] = _parse_non_negative_int(offset, "offset")
     return crud.list_audit_events(**params)
