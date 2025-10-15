@@ -64,6 +64,24 @@
 
 - **自动化回归**：执行 `python -m pytest` 可覆盖所有已实现的管理、授权、审计、审批、命令策略、网关等流程，确保功能行为稳定。
 - **本地部署**：通过 `python -m app.server` 可直接启动内置 HTTP 服务，无需额外依赖。详细部署指引（含数据库路径、端口修改与样例调用）见 [docs/deployment-guide.md](docs/deployment-guide.md)。
+- **功能巡检脚本**：运行 `python scripts/verify_installation.py` 将自动初始化演示数据库、启动 HTTP 服务并串联用户、主机、授权、会话、连接指引等核心流程，输出的 JSON 结果可作为验收凭证与日常健康检查脚本。
+
+## 示例：通过 API 登录目标主机
+
+目前项目仍以前后端分离架构为目标，Web 控制台尚在规划阶段。以下步骤展示了如何使用已经完成的管理 API 进行运维登录：
+
+1. **准备环境**：启动服务 `python -m app.server`（如需指定数据库文件，可通过 `BASTION_DATABASE_URL` 环境变量设定）。
+2. **创建管理员与运维用户**：分别向 `/users` 提交管理员（包含 `admin` / `operator` 角色）和运维员账号，记录返回的 `id`。
+3. **登记协议网关与主机**：
+   - 调用 `/protocol-gateways` 注册 SSH/RDP 等协议网关。
+   - 调用 `/hosts` 创建目标主机，并通过 `/hosts/{host_id}/gateways/{protocol}` 绑定对应网关。
+4. **录入主机凭据与授权**：
+   - 在 `/credentials` 保存目标主机的登录凭据（密码或 SSH Key），建议由管理员维护并设置 `performed_by` 便于审计。
+   - 通过 `/authorizations` 为运维员授予访问权限，可选配置来源 IP 白名单 `source_cidrs`、命令策略 `command_policy_id` 以及审批开关 `requires_approval`。
+5. **发起会话**：运维员调用 `/sessions`，携带 `user_id`、`host_id`、`protocol`、`source_ip` 以及可选的 `requested_commands` 即可申请访问。系统会自动校验授权、审批、命令策略与访问时间窗等限制。
+6. **获取登录指引**：在会话保持开启状态时，调用 `/sessions/{session_id}/connections` 并传入运维员 ID 与凭据 ID，即可获得带有 ProxyJump、TLS 等参数的标准登录命令。完成实际登录后，可通过 `/session-connections/{attempt_id}` 更新为 `succeeded` 或 `failed` 并记录原因。
+
+上述流程亦可通过 `scripts/verify_installation.py` 自动化执行一次演示运行，脚本最终会输出会话与连接指引示例，帮助快速确认部署是否可用。
 
 ## 操作审计说明
 

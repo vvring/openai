@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 bastion.db
 test-bastion.db
+demo-bastion.db
