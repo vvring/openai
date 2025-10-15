@@ -1,4 +1,8 @@
+import http.client
+import json
 import os
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
@@ -15,6 +19,7 @@ os.environ['BASTION_DATABASE_URL'] = f'sqlite:///{TEST_DB}'
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.server import create_server
 
 client = TestClient(app)
 
@@ -2045,3 +2050,77 @@ def cleanup_db():
     yield
     if TEST_DB.exists():
         TEST_DB.unlink()
+
+def _http_request(host: str, port: int, method: str, path: str, body: Optional[Dict] = None):
+    connection = http.client.HTTPConnection(host, port, timeout=5)
+    headers = {}
+    payload = None
+    if body is not None:
+        payload = json.dumps(body)
+        headers["Content-Type"] = "application/json"
+    connection.request(method, path, body=payload, headers=headers)
+    response = connection.getresponse()
+    raw = response.read()
+    connection.close()
+    data = json.loads(raw.decode("utf-8")) if raw else None
+    return response.status, data
+
+
+def test_http_server_serves_management_api():
+    server = create_server("127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    time.sleep(0.05)
+    try:
+        status, user = _http_request(
+            host,
+            port,
+            "POST",
+            "/users",
+            {
+                "username": "operator",
+                "full_name": "Ops Engineer",
+                "email": "ops@example.com",
+                "roles": ["operator"],
+            },
+        )
+        assert status == 201
+        status, host_payload = _http_request(
+            host,
+            port,
+            "POST",
+            "/hosts",
+            {
+                "name": "db01",
+                "hostname": "db01.internal",
+                "port": 22,
+                "operating_system": "linux",
+                "protocols": ["ssh"],
+                "tls_enabled": True,
+                "rdp_nla": True,
+            },
+        )
+        assert status == 201
+        status, _ = _http_request(
+            host,
+            port,
+            "POST",
+            "/authorizations",
+            {
+                "user_id": user["id"],
+                "host_id": host_payload["id"],
+                "privileges": "read",
+            },
+        )
+        assert status == 204
+        status, sessions = _http_request(host, port, "GET", "/sessions")
+        assert status == 200
+        assert sessions == []
+        status, users = _http_request(host, port, "GET", "/users")
+        assert status == 200
+        assert any(entry["username"] == "operator" for entry in users)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
