@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.13.0")
+app = FastAPI(title="Bastion Management Service", version="0.14.0")
 
 
 def _handle_validation_error(func):
@@ -838,6 +838,65 @@ def list_sessions(
 @_handle_validation_error
 def get_session(session_id: str) -> Dict:
     return crud.get_session(_parse_int(session_id, "session_id"))
+
+
+@app.post("/sessions/{session_id}/connections", status_code=status.HTTP_201_CREATED)
+@_handle_validation_error
+def create_session_connection(session_id: str, payload: Dict) -> Dict:
+    if "initiated_by" not in payload:
+        raise ValidationError("initiated_by is required")
+    if "credential_id" not in payload:
+        raise ValidationError("credential_id is required")
+    protocol = payload.get("protocol")
+    if protocol is not None and not isinstance(protocol, str):
+        raise ValidationError("protocol must be a string if provided")
+    return crud.create_session_connection(
+        _parse_int(session_id, "session_id"),
+        initiated_by=_parse_int(payload.get("initiated_by"), "initiated_by"),
+        credential_id=_parse_int(payload.get("credential_id"), "credential_id"),
+        protocol=protocol,
+    )
+
+
+@app.get("/sessions/{session_id}/connections")
+@_handle_validation_error
+def list_session_connections(
+    session_id: str,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
+) -> List[Dict]:
+    parsed_limit: Optional[int] = None
+    parsed_offset: Optional[int] = None
+    if limit is not None:
+        parsed_limit = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        parsed_offset = _parse_non_negative_int(offset, "offset")
+    return crud.list_session_connections(
+        _parse_int(session_id, "session_id"),
+        limit=parsed_limit,
+        offset=parsed_offset,
+    )
+
+
+@app.patch("/session-connections/{attempt_id}")
+@_handle_validation_error
+def update_session_connection(attempt_id: str, payload: Dict) -> Dict:
+    status_value = payload.get("status")
+    if status_value is None:
+        raise ValidationError("status is required")
+    if not isinstance(status_value, str):
+        raise ValidationError("status must be a string")
+    if "performed_by" not in payload:
+        raise ValidationError("performed_by is required")
+    failure_reason = payload.get("failure_reason")
+    if failure_reason is not None and not isinstance(failure_reason, str):
+        raise ValidationError("failure_reason must be a string if provided")
+    return crud.update_session_connection(
+        _parse_int(attempt_id, "attempt_id"),
+        status=status_value,
+        performed_by=_parse_int(payload.get("performed_by"), "performed_by"),
+        failure_reason=failure_reason,
+    )
 
 
 @app.get("/recordings")

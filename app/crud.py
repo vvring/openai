@@ -23,6 +23,10 @@ from .models import (
     ROLE_ADMIN,
     ROLE_AUDITOR,
     ROLE_OPERATOR,
+    SESSION_CONNECTION_STATUSES,
+    SESSION_CONNECTION_STATUS_FAILED,
+    SESSION_CONNECTION_STATUS_PENDING,
+    SESSION_CONNECTION_STATUS_SUCCEEDED,
     SUPPORTED_CREDENTIAL_SECRET_TYPES,
     SUPPORTED_ENVIRONMENTS,
     SUPPORTED_PRIVILEGES,
@@ -151,6 +155,22 @@ def _row_to_recording(row) -> Dict:
         "checksum": row["checksum"],
         "created_at": row["created_at"],
         "metadata": metadata,
+    }
+
+
+def _row_to_connection_attempt(row) -> Dict:
+    instructions = _json_loads(row["instructions"]) if row["instructions"] else None
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "initiated_by": row["initiated_by"],
+        "credential_id": row["credential_id"],
+        "protocol": row["protocol"],
+        "status": row["status"],
+        "instructions": instructions,
+        "failure_reason": row["failure_reason"],
+        "created_at": row["created_at"],
+        "completed_at": row["completed_at"],
     }
 
 
@@ -471,6 +491,18 @@ def _ensure_actor(conn: sqlite3.Connection, actor_id: Optional[int]) -> Optional
     return actor_int
 
 
+def _ensure_active_actor(
+    conn: sqlite3.Connection, actor_id: Optional[int], *, field: str
+) -> int:
+    actor = _ensure_actor(conn, actor_id)
+    if actor is None:
+        raise ValidationError(f"{field} must be provided")
+    row = _ensure_user_row(conn, actor)
+    if not bool(row["is_active"]):
+        raise ValidationError(f"{field} must reference an active user")
+    return actor
+
+
 def _ensure_user_row(conn: sqlite3.Connection, user_id: int):
     row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     if not row:
@@ -505,6 +537,23 @@ def _ensure_host(conn: sqlite3.Connection, host_id: int):
     row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
     if not row:
         raise ValidationError(f"Host {host_id} not found")
+    return row
+
+
+def _ensure_session(conn: sqlite3.Connection, session_id: int):
+    row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    if not row:
+        raise ValidationError(f"Session {session_id} not found")
+    return row
+
+
+def _ensure_credential_row(conn: sqlite3.Connection, credential_id: int):
+    row = conn.execute(
+        "SELECT * FROM credentials WHERE id = ?",
+        (credential_id,),
+    ).fetchone()
+    if not row:
+        raise ValidationError(f"Credential {credential_id} not found")
     return row
 
 
@@ -598,6 +647,56 @@ def _ensure_command_policy(
     if not row:
         raise ValidationError(f"Command policy {command_policy_id} not found")
     return _row_to_command_policy(row)
+
+
+def _build_connection_instructions(
+    host_row,
+    credential_row,
+    protocol: str,
+) -> Dict:
+    secret = credential_row["secret"] or ""
+    preview = secret[-4:] if secret else None
+    notes: List[str] = []
+    hostname = host_row["hostname"]
+    port = host_row["port"]
+    username = credential_row["username"]
+    command: Optional[str] = None
+    if protocol == "ssh":
+        command = f"ssh {username}@{hostname} -p {port}"
+        notes.append("Verify host key fingerprint before accepting the SSH connection.")
+    elif protocol == "sftp":
+        command = f"sftp -P {port} {username}@{hostname}"
+        notes.append("Use the bastion recording agent if file transfer sessions require capture.")
+    elif protocol == "vnc":
+        command = f"vncviewer {hostname}::{port}"
+        notes.append("Establish an SSH tunnel or TLS if the VNC client supports it.")
+    elif protocol == "rdp":
+        command = f"xfreerdp /v:{hostname}:{port} /u:{username}"
+        notes.append("Network Level Authentication (NLA) is required for this host.")
+        if bool(host_row["tls_enabled"]):
+            notes.append("Import the host certificate or enable /cert:tofu when testing.")
+    instructions: Dict[str, Any] = {
+        "protocol": protocol,
+        "host": {
+            "id": host_row["id"],
+            "name": host_row["name"],
+            "hostname": hostname,
+            "port": port,
+            "tls_enabled": bool(host_row["tls_enabled"]),
+            "rdp_nla": bool(host_row["rdp_nla"]),
+        },
+        "credential_hint": {
+            "name": credential_row["name"],
+            "username": username,
+            "secret_type": credential_row["secret_type"],
+            "secret_preview": preview,
+            "last_rotated_at": credential_row["last_rotated_at"],
+            "rotation_frequency_days": credential_row["rotation_frequency_days"],
+        },
+        "command": command,
+        "notes": notes,
+    }
+    return instructions
 
 
 def _validate_access_window_payload(
@@ -2698,6 +2797,182 @@ def get_session(record_id: int) -> Dict:
         ).fetchall()
         session["recordings"] = [_row_to_recording(recording) for recording in recordings]
         return session
+
+
+def create_session_connection(
+    session_id: int,
+    *,
+    initiated_by: int,
+    credential_id: int,
+    protocol: Optional[str] = None,
+) -> Dict:
+    with get_connection() as conn:
+        session_row = _ensure_session(conn, session_id)
+        if session_row["ended_at"] is not None:
+            raise ValidationError("Cannot initiate connections for a session that has ended")
+        actor_id = _ensure_active_actor(conn, initiated_by, field="initiated_by")
+        actor_row = _ensure_user_row(conn, actor_id)
+        actor_roles = _json_loads(actor_row["roles"]) or []
+        if (
+            actor_id != session_row["user_id"]
+            and ROLE_ADMIN not in actor_roles
+            and ROLE_OPERATOR not in actor_roles
+        ):
+            raise ValidationError(
+                "initiated_by must be the session owner or have admin/operator role"
+            )
+        chosen_protocol = protocol or session_row["protocol"]
+        if chosen_protocol not in SUPPORTED_PROTOCOLS:
+            raise ValidationError("Unsupported protocol for connection attempt")
+        if chosen_protocol != session_row["protocol"]:
+            raise ValidationError("protocol must match the session's protocol")
+        credential_row = _ensure_credential_row(conn, credential_id)
+        if credential_row["host_id"] != session_row["host_id"]:
+            raise ValidationError("credential must belong to the session's host")
+        if not bool(credential_row["is_active"]):
+            raise ValidationError("credential must be active")
+        host_row = _ensure_host(conn, session_row["host_id"])
+        instructions = _build_connection_instructions(host_row, credential_row, chosen_protocol)
+        now = datetime.now(tz=timezone.utc).isoformat()
+        cursor = conn.execute(
+            """
+            INSERT INTO session_connections (
+                session_id,
+                initiated_by,
+                credential_id,
+                protocol,
+                status,
+                instructions,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                actor_id,
+                credential_id,
+                chosen_protocol,
+                SESSION_CONNECTION_STATUS_PENDING,
+                json.dumps(instructions),
+                now,
+            ),
+        )
+        attempt_id = cursor.lastrowid
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="session_connection.requested",
+            target_type="session_connection",
+            target_id=attempt_id,
+            metadata={
+                "session_id": session_id,
+                "protocol": chosen_protocol,
+                "credential_id": credential_id,
+            },
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM session_connections WHERE id = ?",
+            (attempt_id,),
+        ).fetchone()
+        return _row_to_connection_attempt(row)
+
+
+def list_session_connections(
+    session_id: int,
+    *,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> List[Dict]:
+    _validate_pagination(limit, offset)
+    with get_connection() as conn:
+        _ensure_session(conn, session_id)
+        query = "SELECT * FROM session_connections WHERE session_id = ? ORDER BY id ASC"
+        params: List[Any] = [session_id]
+        query, params = _apply_pagination(query, params, limit, offset)
+        rows = conn.execute(query, tuple(params)).fetchall()
+        return [_row_to_connection_attempt(row) for row in rows]
+
+
+def update_session_connection(
+    attempt_id: int,
+    *,
+    status: str,
+    performed_by: int,
+    failure_reason: Optional[str] = None,
+) -> Dict:
+    if status not in SESSION_CONNECTION_STATUSES:
+        raise ValidationError("Unsupported status for session connection")
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM session_connections WHERE id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if not row:
+            raise ValidationError(f"Session connection {attempt_id} not found")
+        if row["status"] == status:
+            return _row_to_connection_attempt(row)
+        if row["status"] != SESSION_CONNECTION_STATUS_PENDING:
+            raise ValidationError("Only pending connection attempts can be updated")
+        actor_id = _ensure_active_actor(conn, performed_by, field="performed_by")
+        actor_row = _ensure_user_row(conn, actor_id)
+        actor_roles = _json_loads(actor_row["roles"]) or []
+        if (
+            actor_id != row["initiated_by"]
+            and ROLE_ADMIN not in actor_roles
+            and ROLE_OPERATOR not in actor_roles
+        ):
+            raise ValidationError(
+                "performed_by must be the initiator or have admin/operator role"
+            )
+        update_fields = ["status = ?", "completed_at = ?"]
+        params: List[Any] = []
+        now = datetime.now(tz=timezone.utc).isoformat()
+        params.append(status)
+        params.append(now)
+        reason_value: Optional[str] = None
+        if status == SESSION_CONNECTION_STATUS_FAILED:
+            if failure_reason is None:
+                raise ValidationError("failure_reason is required when marking as failed")
+            if not isinstance(failure_reason, str):
+                raise ValidationError("failure_reason must be a string")
+            cleaned = failure_reason.strip()
+            if not cleaned:
+                raise ValidationError("failure_reason cannot be empty")
+            if len(cleaned) > 500:
+                raise ValidationError("failure_reason cannot exceed 500 characters")
+            reason_value = cleaned
+        elif failure_reason is not None:
+            raise ValidationError("failure_reason can only be provided for failed status")
+        update_fields.append("failure_reason = ?")
+        params.append(reason_value)
+        params.append(attempt_id)
+        conn.execute(
+            f"UPDATE session_connections SET {', '.join(update_fields)} WHERE id = ?",
+            tuple(params),
+        )
+        action = "session_connection.succeeded"
+        metadata: Dict[str, Any] = {
+            "session_id": row["session_id"],
+            "protocol": row["protocol"],
+        }
+        if status == SESSION_CONNECTION_STATUS_FAILED:
+            action = "session_connection.failed"
+            metadata["failure_reason"] = reason_value
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action=action,
+            target_type="session_connection",
+            target_id=attempt_id,
+            metadata=metadata,
+        )
+        conn.commit()
+        updated = conn.execute(
+            "SELECT * FROM session_connections WHERE id = ?",
+            (attempt_id,),
+        ).fetchone()
+        return _row_to_connection_attempt(updated)
 
 
 def list_recordings(

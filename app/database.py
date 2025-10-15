@@ -269,6 +269,31 @@ def init_db() -> None:
         )
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS session_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                initiated_by INTEGER NOT NULL,
+                credential_id INTEGER,
+                protocol TEXT NOT NULL,
+                status TEXT NOT NULL,
+                instructions TEXT,
+                failure_reason TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY(initiated_by) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(credential_id) REFERENCES credentials(id) ON DELETE SET NULL
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_connections_session ON session_connections(session_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_connections_status ON session_connections(status)"
+        )
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 actor_id INTEGER NOT NULL,

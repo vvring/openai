@@ -22,6 +22,7 @@ def fresh_database():
     with get_connection() as conn:
         for table in (
             "audit_events",
+            "session_connections",
             "recordings",
             "sessions",
             "access_requests",
@@ -40,6 +41,7 @@ def fresh_database():
     with get_connection() as conn:
         for table in (
             "audit_events",
+            "session_connections",
             "recordings",
             "sessions",
             "access_requests",
@@ -362,6 +364,141 @@ def test_credential_lifecycle():
     disabled = disabled_resp.json()
     assert len(disabled) == 1
     assert disabled[0]["id"] == credential["id"]
+
+
+def test_session_connection_attempt_flow():
+    admin_resp = client.post(
+        "/users",
+        json={
+            "username": "connect-admin",
+            "full_name": "Connect Admin",
+            "email": "connect-admin@example.com",
+            "roles": ["admin"],
+        },
+    )
+    assert admin_resp.status_code == 201, admin_resp.text
+    admin_id = admin_resp.json()["id"]
+
+    operator_resp = client.post(
+        "/users",
+        json={
+            "username": "connect-operator",
+            "full_name": "Connect Operator",
+            "email": "connect-operator@example.com",
+            "roles": ["operator"],
+        },
+    )
+    assert operator_resp.status_code == 201, operator_resp.text
+    operator_id = operator_resp.json()["id"]
+
+    host_resp = client.post(
+        "/hosts",
+        json={
+            "name": "connect-host",
+            "hostname": "10.5.0.10",
+            "port": 22,
+            "operating_system": "linux",
+            "protocols": ["ssh", "sftp"],
+            "tls_enabled": True,
+            "rdp_nla": True,
+            "performed_by": admin_id,
+        },
+    )
+    assert host_resp.status_code == 201, host_resp.text
+    host_id = host_resp.json()["id"]
+
+    credential_resp = client.post(
+        "/credentials",
+        json={
+            "host_id": host_id,
+            "name": "connect-root",
+            "username": "root",
+            "secret": "root-password",
+            "secret_type": "password",
+            "performed_by": admin_id,
+        },
+    )
+    assert credential_resp.status_code == 201, credential_resp.text
+    credential_id = credential_resp.json()["id"]
+
+    auth_resp = client.post(
+        "/authorizations",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "privileges": "read-write",
+        },
+    )
+    assert auth_resp.status_code == 204, auth_resp.text
+
+    session_resp = client.post(
+        "/sessions",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.77",
+        },
+    )
+    assert session_resp.status_code == 201, session_resp.text
+    session_id = session_resp.json()["id"]
+
+    attempt_resp = client.post(
+        f"/sessions/{session_id}/connections",
+        json={
+            "initiated_by": operator_id,
+            "credential_id": credential_id,
+        },
+    )
+    assert attempt_resp.status_code == 201, attempt_resp.text
+    attempt = attempt_resp.json()
+    assert attempt["status"] == "pending"
+    assert attempt["instructions"]["command"].startswith("ssh root@10.5.0.10")
+
+    list_resp = client.get(f"/sessions/{session_id}/connections")
+    assert list_resp.status_code == 200, list_resp.text
+    attempts = list_resp.json()
+    assert len(attempts) == 1
+    assert attempts[0]["credential_id"] == credential_id
+    assert attempts[0]["instructions"]["credential_hint"]["secret_preview"] == "word"
+
+    update_resp = client.patch(
+        f"/session-connections/{attempt['id']}",
+        json={"status": "succeeded", "performed_by": operator_id},
+    )
+    assert update_resp.status_code == 200, update_resp.text
+    updated_attempt = update_resp.json()
+    assert updated_attempt["status"] == "succeeded"
+    assert updated_attempt["failure_reason"] is None
+
+    second_attempt_resp = client.post(
+        f"/sessions/{session_id}/connections",
+        json={
+            "initiated_by": operator_id,
+            "credential_id": credential_id,
+        },
+    )
+    assert second_attempt_resp.status_code == 201, second_attempt_resp.text
+    second_attempt = second_attempt_resp.json()
+
+    fail_resp = client.patch(
+        f"/session-connections/{second_attempt['id']}",
+        json={
+            "status": "failed",
+            "performed_by": admin_id,
+            "failure_reason": "SSH host key mismatch",
+        },
+    )
+    assert fail_resp.status_code == 200, fail_resp.text
+    failed_attempt = fail_resp.json()
+    assert failed_attempt["status"] == "failed"
+    assert failed_attempt["failure_reason"] == "SSH host key mismatch"
+
+    final_list = client.get(f"/sessions/{session_id}/connections")
+    assert final_list.status_code == 200
+    final_attempts = final_list.json()
+    assert len(final_attempts) == 2
+    assert {item["status"] for item in final_attempts} == {"succeeded", "failed"}
 
 
 def test_credential_secret_type_validation():
