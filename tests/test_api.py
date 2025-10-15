@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -24,6 +24,7 @@ def fresh_database():
             "audit_events",
             "recordings",
             "sessions",
+            "access_requests",
             "authorizations",
             "host_group_members",
             "host_groups",
@@ -39,6 +40,7 @@ def fresh_database():
             "audit_events",
             "recordings",
             "sessions",
+            "access_requests",
             "authorizations",
             "host_group_members",
             "host_groups",
@@ -1026,6 +1028,159 @@ def test_list_endpoints_support_pagination():
 
     resp = client.get("/audit-events?offset=-5")
     assert resp.status_code == 400
+
+
+def test_access_request_approval_flow():
+    admin_resp = client.post(
+        "/users",
+        json={
+            "username": "sec-admin",
+            "full_name": "Security Admin",
+            "email": "sec-admin@example.com",
+            "roles": ["admin", "auditor"],
+        },
+    )
+    assert admin_resp.status_code == 201, admin_resp.text
+    admin_id = admin_resp.json()["id"]
+
+    operator_resp = client.post(
+        "/users",
+        json={
+            "username": "ops-user",
+            "full_name": "Ops User",
+            "email": "ops@example.com",
+            "roles": ["operator"],
+        },
+    )
+    assert operator_resp.status_code == 201, operator_resp.text
+    operator_id = operator_resp.json()["id"]
+
+    host_resp = client.post(
+        "/hosts",
+        json={
+            "name": "ops-host",
+            "hostname": "10.2.0.5",
+            "port": 22,
+            "operating_system": "linux",
+            "protocols": ["ssh"],
+            "tls_enabled": True,
+            "rdp_nla": False,
+            "performed_by": admin_id,
+        },
+    )
+    assert host_resp.status_code == 201, host_resp.text
+    host_id = host_resp.json()["id"]
+
+    assign_resp = client.post(
+        "/authorizations",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "privileges": "read",
+            "performed_by": admin_id,
+            "requires_approval": True,
+        },
+    )
+    assert assign_resp.status_code == 204, assign_resp.text
+
+    auth_list = client.get(f"/authorizations?user_id={operator_id}&host_id={host_id}")
+    assert auth_list.status_code == 200, auth_list.text
+    authorization = auth_list.json()[0]
+    assert authorization["requires_approval"] is True
+    auth_id = authorization["id"]
+
+    filtered = client.get("/authorizations?requires_approval=true")
+    assert filtered.status_code == 200
+    assert any(item["id"] == auth_id for item in filtered.json())
+
+    start_resp = client.post(
+        "/sessions",
+        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+    )
+    assert start_resp.status_code == 400
+    assert "requires an approved request" in start_resp.json()["detail"].lower()
+
+    request_resp = client.post(
+        "/access-requests",
+        json={
+            "authorization_id": auth_id,
+            "requested_by": operator_id,
+            "reason": "weekly maintenance",
+        },
+    )
+    assert request_resp.status_code == 201, request_resp.text
+    request_id = request_resp.json()["id"]
+    assert request_resp.json()["status"] == "pending"
+
+    duplicate_resp = client.post(
+        "/access-requests",
+        json={"authorization_id": auth_id, "requested_by": operator_id},
+    )
+    assert duplicate_resp.status_code == 400
+
+    pending_resp = client.get("/access-requests?status=pending")
+    assert pending_resp.status_code == 200
+    assert any(item["id"] == request_id for item in pending_resp.json())
+
+    expiry = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+    approve_resp = client.post(
+        f"/access-requests/{request_id}/approve",
+        json={"reviewer_id": admin_id, "expires_at": expiry, "note": "approved"},
+    )
+    assert approve_resp.status_code == 200, approve_resp.text
+    assert approve_resp.json()["status"] == "approved"
+
+    session_resp = client.post(
+        "/sessions",
+        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+    )
+    assert session_resp.status_code == 201, session_resp.text
+
+    approved_resp = client.get(f"/access-requests?authorization_id={auth_id}&status=approved")
+    assert approved_resp.status_code == 200
+    assert len(approved_resp.json()) == 1
+
+    revoke_resp = client.post(
+        f"/access-requests/{request_id}/revoke",
+        json={"reviewer_id": admin_id, "note": "expired window"},
+    )
+    assert revoke_resp.status_code == 200, revoke_resp.text
+    assert revoke_resp.json()["status"] == "revoked"
+
+    blocked_resp = client.post(
+        "/sessions",
+        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+    )
+    assert blocked_resp.status_code == 400
+
+    admin_request_resp = client.post(
+        "/access-requests",
+        json={
+            "authorization_id": auth_id,
+            "requested_by": admin_id,
+            "reason": "emergency access",
+        },
+    )
+    assert admin_request_resp.status_code == 201, admin_request_resp.text
+    admin_request_id = admin_request_resp.json()["id"]
+    assert admin_request_resp.json()["user_id"] == operator_id
+
+    deny_resp = client.post(
+        f"/access-requests/{admin_request_id}/deny",
+        json={"reviewer_id": admin_id, "note": "not needed"},
+    )
+    assert deny_resp.status_code == 200, deny_resp.text
+    assert deny_resp.json()["status"] == "denied"
+
+    denied_list = client.get("/access-requests?status=denied")
+    assert denied_list.status_code == 200
+    assert any(item["id"] == admin_request_id for item in denied_list.json())
+
+    final_resp = client.post(
+        "/sessions",
+        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+    )
+    assert final_resp.status_code == 400
 
 
 @pytest.fixture(autouse=True, scope='module')

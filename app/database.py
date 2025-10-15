@@ -35,6 +35,34 @@ def _ensure_authorization_columns(cursor: sqlite3.Cursor) -> None:
     existing = {row[1] for row in cursor.fetchall()}
     if "access_window_id" not in existing:
         cursor.execute("ALTER TABLE authorizations ADD COLUMN access_window_id INTEGER")
+    if "requires_approval" not in existing:
+        cursor.execute(
+            "ALTER TABLE authorizations ADD COLUMN requires_approval INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def _ensure_access_request_columns(cursor: sqlite3.Cursor) -> None:
+    cursor.execute("PRAGMA table_info(access_requests)")
+    existing = {row[1] for row in cursor.fetchall()}
+    required_columns = {
+        "authorization_id",
+        "user_id",
+        "host_id",
+        "status",
+        "reason",
+        "requested_by",
+        "reviewer_id",
+        "reviewer_note",
+        "reviewed_at",
+        "expires_at",
+        "created_at",
+        "updated_at",
+    }
+    missing = required_columns - existing
+    if missing and existing:
+        raise RuntimeError(
+            "Existing access_requests table is missing columns: " + ", ".join(sorted(missing))
+        )
 
 
 def init_db() -> None:
@@ -98,6 +126,7 @@ def init_db() -> None:
                 host_id INTEGER NOT NULL,
                 privileges TEXT NOT NULL,
                 access_window_id INTEGER,
+                requires_approval INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(user_id, host_id),
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE
@@ -105,6 +134,37 @@ def init_db() -> None:
             """
         )
         _ensure_authorization_columns(cursor)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS access_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                authorization_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                host_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                requested_by INTEGER,
+                reviewer_id INTEGER,
+                reviewer_note TEXT,
+                reviewed_at TEXT,
+                expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(authorization_id) REFERENCES authorizations(id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE,
+                FOREIGN KEY(requested_by) REFERENCES users(id) ON DELETE SET NULL,
+                FOREIGN KEY(reviewer_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """
+        )
+        _ensure_access_request_columns(cursor)
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_access_requests_authorization ON access_requests(authorization_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_access_requests_status ON access_requests(status)"
+        )
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS access_windows (

@@ -46,6 +46,7 @@ class Authorization:
     host_id: int
     privileges: str
     access_window_id: Optional[int] = None
+    requires_approval: bool = False
 
 
 @dataclass(slots=True)
@@ -80,3 +81,20 @@ class AuditEvent:
     target_id: Optional[int]
     created_at: datetime
     metadata: Optional[Dict] = None
+
+
+@dataclass(slots=True)
+class AccessRequest:
+    id: int
+    authorization_id: int
+    user_id: int
+    host_id: int
+    status: str
+    reason: Optional[str]
+    requested_by: int
+    reviewer_id: Optional[int]
+    reviewer_note: Optional[str]
+    reviewed_at: Optional[datetime]
+    expires_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime

@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.9.0")
+app = FastAPI(title="Bastion Management Service", version="0.10.0")
 
 
 def _handle_validation_error(func):
@@ -425,11 +425,16 @@ def assign_authorization(payload: Dict):
     parsed_window: Optional[int] = None
     if access_window_id is not None:
         parsed_window = _parse_int(access_window_id, "access_window_id")
+    requires_approval = payload.get("requires_approval")
+    parsed_requires = False
+    if requires_approval is not None:
+        parsed_requires = _parse_bool(requires_approval, "requires_approval")
     crud.authorize_user(
         user_id,
         host_id,
         payload.get("privileges", "read"),
         access_window_id=parsed_window,
+        requires_approval=parsed_requires,
         performed_by=parsed_actor,
     )
     return None
@@ -441,12 +446,14 @@ def list_authorizations(
     user_id: Optional[str] = None,
     host_id: Optional[str] = None,
     access_window_id: Optional[str] = None,
+    requires_approval: Optional[str] = None,
     limit: Optional[str] = None,
     offset: Optional[str] = None,
 ) -> List[Dict]:
     parsed_user: Optional[int] = None
     parsed_host: Optional[int] = None
     parsed_window: Optional[int] = None
+    parsed_requires: Optional[bool] = None
     parsed_limit: Optional[int] = None
     parsed_offset: Optional[int] = None
     if user_id is not None:
@@ -455,6 +462,8 @@ def list_authorizations(
         parsed_host = _parse_int(host_id, "host_id")
     if access_window_id is not None:
         parsed_window = _parse_int(access_window_id, "access_window_id")
+    if requires_approval is not None:
+        parsed_requires = _parse_bool(requires_approval, "requires_approval")
     if limit is not None:
         parsed_limit = _parse_positive_int(limit, "limit")
     if offset is not None:
@@ -463,6 +472,7 @@ def list_authorizations(
         user_id=parsed_user,
         host_id=parsed_host,
         access_window_id=parsed_window,
+        requires_approval=parsed_requires,
         limit=parsed_limit,
         offset=parsed_offset,
     )
@@ -479,6 +489,88 @@ def delete_authorization(authorization_id: str, performed_by: Optional[str] = No
         performed_by=parsed_actor,
     )
     return None
+
+
+@app.post("/access-requests", status_code=status.HTTP_201_CREATED)
+@_handle_validation_error
+def create_access_request(payload: Dict) -> Dict:
+    authorization_id = _parse_int(payload.get("authorization_id"), "authorization_id")
+    requested_by = _parse_int(payload.get("requested_by"), "requested_by")
+    return crud.create_access_request(
+        authorization_id,
+        requested_by=requested_by,
+        reason=payload.get("reason"),
+    )
+
+
+@app.get("/access-requests")
+@_handle_validation_error
+def list_access_requests(
+    authorization_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    host_id: Optional[str] = None,
+    status: Optional[str] = None,
+    requested_by: Optional[str] = None,
+    reviewer_id: Optional[str] = None,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
+) -> List[Dict]:
+    params: Dict[str, object] = {}
+    if authorization_id is not None:
+        params["authorization_id"] = _parse_int(authorization_id, "authorization_id")
+    if user_id is not None:
+        params["user_id"] = _parse_int(user_id, "user_id")
+    if host_id is not None:
+        params["host_id"] = _parse_int(host_id, "host_id")
+    if status is not None:
+        params["status"] = status.strip().lower()
+    if requested_by is not None:
+        params["requested_by"] = _parse_int(requested_by, "requested_by")
+    if reviewer_id is not None:
+        params["reviewer_id"] = _parse_int(reviewer_id, "reviewer_id")
+    if limit is not None:
+        params["limit"] = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        params["offset"] = _parse_non_negative_int(offset, "offset")
+    return crud.list_access_requests(**params)
+
+
+@app.post("/access-requests/{request_id}/approve")
+@_handle_validation_error
+def approve_access_request(request_id: str, payload: Dict) -> Dict:
+    reviewer_id = _parse_int(payload.get("reviewer_id"), "reviewer_id")
+    expires_at = payload.get("expires_at")
+    parsed_expires: Optional[str] = None
+    if expires_at is not None:
+        parsed_expires = _parse_datetime(expires_at, "expires_at")
+    return crud.approve_access_request(
+        _parse_int(request_id, "request_id"),
+        reviewer_id=reviewer_id,
+        expires_at=parsed_expires,
+        note=payload.get("note"),
+    )
+
+
+@app.post("/access-requests/{request_id}/deny")
+@_handle_validation_error
+def deny_access_request(request_id: str, payload: Dict) -> Dict:
+    reviewer_id = _parse_int(payload.get("reviewer_id"), "reviewer_id")
+    return crud.deny_access_request(
+        _parse_int(request_id, "request_id"),
+        reviewer_id=reviewer_id,
+        note=payload.get("note"),
+    )
+
+
+@app.post("/access-requests/{request_id}/revoke")
+@_handle_validation_error
+def revoke_access_request(request_id: str, payload: Dict) -> Dict:
+    reviewer_id = _parse_int(payload.get("reviewer_id"), "reviewer_id")
+    return crud.revoke_access_request(
+        _parse_int(request_id, "request_id"),
+        reviewer_id=reviewer_id,
+        note=payload.get("note"),
+    )
 
 
 @app.post("/sessions", status_code=status.HTTP_201_CREATED)

@@ -10,6 +10,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .database import get_connection
 from .models import (
+    ACCESS_REQUEST_STATUSES,
+    ACCESS_REQUEST_STATUS_APPROVED,
+    ACCESS_REQUEST_STATUS_DENIED,
+    ACCESS_REQUEST_STATUS_PENDING,
+    ACCESS_REQUEST_STATUS_REVOKED,
     ROLE_ADMIN,
     ROLE_AUDITOR,
     ROLE_OPERATOR,
@@ -85,6 +90,27 @@ def _row_to_authorization(row) -> Dict:
         "host_id": row["host_id"],
         "privileges": row["privileges"],
         "access_window_id": row["access_window_id"],
+        "requires_approval": bool(row["requires_approval"])
+        if "requires_approval" in row.keys()
+        else False,
+    }
+
+
+def _row_to_access_request(row) -> Dict:
+    return {
+        "id": row["id"],
+        "authorization_id": row["authorization_id"],
+        "user_id": row["user_id"],
+        "host_id": row["host_id"],
+        "status": row["status"],
+        "reason": row["reason"],
+        "requested_by": row["requested_by"],
+        "reviewer_id": row["reviewer_id"],
+        "reviewer_note": row["reviewer_note"],
+        "reviewed_at": row["reviewed_at"],
+        "expires_at": row["expires_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
 
 
@@ -319,6 +345,36 @@ def _ensure_actor(conn: sqlite3.Connection, actor_id: Optional[int]) -> Optional
     return actor_int
 
 
+def _ensure_user_row(conn: sqlite3.Connection, user_id: int):
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not row:
+        raise ValidationError(f"User {user_id} not found")
+    return row
+
+
+def _ensure_reviewer(conn: sqlite3.Connection, reviewer_id: Optional[int]) -> int:
+    actor_id = _ensure_actor(conn, reviewer_id)
+    if actor_id is None:
+        raise ValidationError("reviewer must be provided")
+    row = _ensure_user_row(conn, actor_id)
+    if not bool(row["is_active"]):
+        raise ValidationError("reviewer must be an active user")
+    roles = _json_loads(row["roles"]) or []
+    if ROLE_ADMIN not in roles and ROLE_AUDITOR not in roles:
+        raise ValidationError("reviewer must have admin or auditor role")
+    return actor_id
+
+
+def _ensure_authorization(conn: sqlite3.Connection, authorization_id: int):
+    row = conn.execute(
+        "SELECT * FROM authorizations WHERE id = ?",
+        (authorization_id,),
+    ).fetchone()
+    if not row:
+        raise ValidationError(f"Authorization {authorization_id} not found")
+    return row
+
+
 def _parse_time_of_day(value: str, field: str) -> time:
     if not isinstance(value, str):
         raise ValidationError(f"{field} must be a HH:MM string")
@@ -326,6 +382,18 @@ def _parse_time_of_day(value: str, field: str) -> time:
         parsed = datetime.strptime(value, "%H:%M").time()
     except ValueError as exc:
         raise ValidationError(f"{field} must be formatted as HH:MM (24h)") from exc
+    return parsed
+
+
+def _parse_datetime(value: str, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValidationError(f"{field} must be an ISO formatted datetime string")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValidationError(f"{field} must be an ISO formatted datetime string") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
 
 
@@ -435,6 +503,28 @@ def _enforce_access_window(conn: sqlite3.Connection, auth_row) -> None:
     current_time = now_local.time().replace(second=0, microsecond=0)
     if current_time < allowed_start or current_time >= allowed_end:
         raise ValidationError("Access is not permitted at the current time")
+
+
+def _enforce_access_request(conn: sqlite3.Connection, authorization_id: int, user_id: int) -> None:
+    row = conn.execute(
+        """
+        SELECT * FROM access_requests
+        WHERE authorization_id = ?
+          AND user_id = ?
+          AND status = ?
+        ORDER BY reviewed_at DESC, updated_at DESC
+        LIMIT 1
+        """,
+        (authorization_id, user_id, ACCESS_REQUEST_STATUS_APPROVED),
+    ).fetchone()
+    if not row:
+        raise ValidationError("Access requires an approved request")
+    expires_at = row["expires_at"]
+    if expires_at:
+        expires_dt = _parse_datetime(expires_at, "expires_at")
+        now = datetime.now(tz=timezone.utc)
+        if expires_dt < now:
+            raise ValidationError("Access approval has expired")
 
 
 def _record_audit_event(
@@ -1224,6 +1314,7 @@ def authorize_user(
     privileges: str,
     *,
     access_window_id: Optional[int] = None,
+    requires_approval: bool = False,
     performed_by: Optional[int] = None,
 ) -> None:
     if not privileges:
@@ -1250,13 +1341,20 @@ def authorize_user(
         ).fetchone()
         conn.execute(
             """
-            INSERT INTO authorizations (user_id, host_id, privileges, access_window_id)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO authorizations (
+                user_id,
+                host_id,
+                privileges,
+                access_window_id,
+                requires_approval
+            )
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(user_id, host_id) DO UPDATE SET
                 privileges = excluded.privileges,
-                access_window_id = excluded.access_window_id
+                access_window_id = excluded.access_window_id,
+                requires_approval = excluded.requires_approval
             """,
-            (user_id, host_id, privileges, window_id),
+            (user_id, host_id, privileges, window_id, int(bool(requires_approval))),
         )
         row = conn.execute(
             "SELECT * FROM authorizations WHERE user_id = ? AND host_id = ?",
@@ -1269,7 +1367,11 @@ def authorize_user(
             action=action,
             target_type="authorization",
             target_id=row["id"] if row else None,
-            metadata={"privileges": privileges, "access_window_id": row["access_window_id"]},
+            metadata={
+                "privileges": privileges,
+                "access_window_id": row["access_window_id"],
+                "requires_approval": bool(row["requires_approval"]),
+            },
         )
         conn.commit()
 
@@ -1279,6 +1381,7 @@ def list_authorizations(
     user_id: Optional[int] = None,
     host_id: Optional[int] = None,
     access_window_id: Optional[int] = None,
+    requires_approval: Optional[bool] = None,
     limit: Optional[int] = None,
     offset: Optional[int] = None,
 ) -> List[Dict]:
@@ -1295,6 +1398,9 @@ def list_authorizations(
         if access_window_id is not None:
             clauses.append("access_window_id = ?")
             params.append(access_window_id)
+        if requires_approval is not None:
+            clauses.append("requires_approval = ?")
+            params.append(int(bool(requires_approval)))
         if clauses:
             query = "SELECT * FROM authorizations WHERE " + " AND ".join(clauses) + " ORDER BY id ASC"
         else:
@@ -1332,6 +1438,320 @@ def revoke_authorization(authorization_id: int, *, performed_by: Optional[int] =
         conn.commit()
 
 
+def create_access_request(
+    authorization_id: int,
+    *,
+    requested_by: int,
+    reason: Optional[str] = None,
+) -> Dict:
+    if requested_by is None:
+        raise ValidationError("requested_by is required")
+    with get_connection() as conn:
+        auth = _ensure_authorization(conn, authorization_id)
+        requester_id = _ensure_actor(conn, requested_by)
+        requester_row = _ensure_user_row(conn, requester_id)
+        if not bool(requester_row["is_active"]):
+            raise ValidationError("requester must be an active user")
+        subject_user_id = auth["user_id"]
+        if requester_id != subject_user_id:
+            roles = _json_loads(requester_row["roles"]) or []
+            if ROLE_ADMIN not in roles and ROLE_AUDITOR not in roles:
+                raise ValidationError(
+                    "Only admins or auditors may request access on behalf of another user"
+                )
+        if reason is not None:
+            if not isinstance(reason, str):
+                raise ValidationError("reason must be a string if provided")
+            reason = reason.strip()
+            if len(reason) > 500:
+                raise ValidationError("reason must be 500 characters or fewer")
+            if not reason:
+                reason = None
+        existing = conn.execute(
+            """
+            SELECT id FROM access_requests
+            WHERE authorization_id = ? AND user_id = ? AND status = ?
+            """,
+            (authorization_id, subject_user_id, ACCESS_REQUEST_STATUS_PENDING),
+        ).fetchone()
+        if existing:
+            raise ValidationError("An access request is already pending for this authorization")
+        now = datetime.now(tz=timezone.utc).isoformat()
+        cursor = conn.execute(
+            """
+            INSERT INTO access_requests (
+                authorization_id,
+                user_id,
+                host_id,
+                status,
+                reason,
+                requested_by,
+                reviewer_id,
+                reviewer_note,
+                reviewed_at,
+                expires_at,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
+            """,
+            (
+                authorization_id,
+                subject_user_id,
+                auth["host_id"],
+                ACCESS_REQUEST_STATUS_PENDING,
+                reason,
+                requester_id,
+                now,
+                now,
+            ),
+        )
+        request_id = cursor.lastrowid
+        _record_audit_event(
+            conn,
+            actor_id=requester_id,
+            action="access_request.created",
+            target_type="access_request",
+            target_id=request_id,
+            metadata={
+                "authorization_id": authorization_id,
+                "user_id": subject_user_id,
+                "host_id": auth["host_id"],
+            },
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM access_requests WHERE id = ?", (request_id,)).fetchone()
+        return _row_to_access_request(row)
+
+
+def list_access_requests(
+    *,
+    authorization_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    host_id: Optional[int] = None,
+    status: Optional[str] = None,
+    requested_by: Optional[int] = None,
+    reviewer_id: Optional[int] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> List[Dict]:
+    _validate_pagination(limit, offset)
+    with get_connection() as conn:
+        clauses = []
+        params: List[Any] = []
+        if authorization_id is not None:
+            clauses.append("authorization_id = ?")
+            params.append(authorization_id)
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        if host_id is not None:
+            clauses.append("host_id = ?")
+            params.append(host_id)
+        if status is not None:
+            if status not in ACCESS_REQUEST_STATUSES:
+                raise ValidationError("Unsupported access request status")
+            clauses.append("status = ?")
+            params.append(status)
+        if requested_by is not None:
+            clauses.append("requested_by = ?")
+            params.append(requested_by)
+        if reviewer_id is not None:
+            clauses.append("reviewer_id = ?")
+            params.append(reviewer_id)
+        base = "SELECT * FROM access_requests"
+        if clauses:
+            base += " WHERE " + " AND ".join(clauses)
+        base += " ORDER BY created_at DESC"
+        base, params = _apply_pagination(base, params, limit, offset)
+        rows = conn.execute(base, tuple(params)).fetchall()
+        return [_row_to_access_request(row) for row in rows]
+
+
+def approve_access_request(
+    request_id: int,
+    *,
+    reviewer_id: int,
+    expires_at: Optional[str] = None,
+    note: Optional[str] = None,
+) -> Dict:
+    with get_connection() as conn:
+        request = conn.execute(
+            "SELECT * FROM access_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        if not request:
+            raise ValidationError(f"Access request {request_id} not found")
+        if request["status"] != ACCESS_REQUEST_STATUS_PENDING:
+            raise ValidationError("Only pending requests can be approved")
+        reviewer = _ensure_reviewer(conn, reviewer_id)
+        expires_iso: Optional[str] = None
+        if expires_at is not None:
+            parsed = _parse_datetime(expires_at, "expires_at")
+            if parsed <= datetime.now(tz=timezone.utc):
+                raise ValidationError("expires_at must be in the future")
+            expires_iso = parsed.isoformat()
+        reviewer_note: Optional[str] = None
+        if note is not None:
+            if not isinstance(note, str):
+                raise ValidationError("note must be a string if provided")
+            cleaned = note.strip()
+            if len(cleaned) > 500:
+                raise ValidationError("note must be 500 characters or fewer")
+            reviewer_note = cleaned or None
+        now = datetime.now(tz=timezone.utc).isoformat()
+        conn.execute(
+            """
+            UPDATE access_requests
+            SET status = ?,
+                reviewer_id = ?,
+                reviewer_note = ?,
+                reviewed_at = ?,
+                expires_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                ACCESS_REQUEST_STATUS_APPROVED,
+                reviewer,
+                reviewer_note,
+                now,
+                expires_iso,
+                now,
+                request_id,
+            ),
+        )
+        _record_audit_event(
+            conn,
+            actor_id=reviewer,
+            action="access_request.approved",
+            target_type="access_request",
+            target_id=request_id,
+            metadata={
+                "expires_at": expires_iso,
+                "note": reviewer_note,
+            },
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM access_requests WHERE id = ?", (request_id,)).fetchone()
+        return _row_to_access_request(row)
+
+
+def deny_access_request(
+    request_id: int,
+    *,
+    reviewer_id: int,
+    note: Optional[str] = None,
+) -> Dict:
+    with get_connection() as conn:
+        request = conn.execute(
+            "SELECT * FROM access_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        if not request:
+            raise ValidationError(f"Access request {request_id} not found")
+        if request["status"] != ACCESS_REQUEST_STATUS_PENDING:
+            raise ValidationError("Only pending requests can be denied")
+        reviewer = _ensure_reviewer(conn, reviewer_id)
+        reviewer_note: Optional[str] = None
+        if note is not None:
+            if not isinstance(note, str):
+                raise ValidationError("note must be a string if provided")
+            cleaned = note.strip()
+            if len(cleaned) > 500:
+                raise ValidationError("note must be 500 characters or fewer")
+            reviewer_note = cleaned or None
+        now = datetime.now(tz=timezone.utc).isoformat()
+        conn.execute(
+            """
+            UPDATE access_requests
+            SET status = ?,
+                reviewer_id = ?,
+                reviewer_note = ?,
+                reviewed_at = ?,
+                expires_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                ACCESS_REQUEST_STATUS_DENIED,
+                reviewer,
+                reviewer_note,
+                now,
+                now,
+                request_id,
+            ),
+        )
+        _record_audit_event(
+            conn,
+            actor_id=reviewer,
+            action="access_request.denied",
+            target_type="access_request",
+            target_id=request_id,
+            metadata={"note": reviewer_note},
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM access_requests WHERE id = ?", (request_id,)).fetchone()
+        return _row_to_access_request(row)
+
+
+def revoke_access_request(
+    request_id: int,
+    *,
+    reviewer_id: int,
+    note: Optional[str] = None,
+) -> Dict:
+    with get_connection() as conn:
+        request = conn.execute(
+            "SELECT * FROM access_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        if not request:
+            raise ValidationError(f"Access request {request_id} not found")
+        if request["status"] != ACCESS_REQUEST_STATUS_APPROVED:
+            raise ValidationError("Only approved requests can be revoked")
+        reviewer = _ensure_reviewer(conn, reviewer_id)
+        reviewer_note: Optional[str] = None
+        if note is not None:
+            if not isinstance(note, str):
+                raise ValidationError("note must be a string if provided")
+            cleaned = note.strip()
+            if len(cleaned) > 500:
+                raise ValidationError("note must be 500 characters or fewer")
+            reviewer_note = cleaned or None
+        now = datetime.now(tz=timezone.utc).isoformat()
+        conn.execute(
+            """
+            UPDATE access_requests
+            SET status = ?,
+                reviewer_id = ?,
+                reviewer_note = ?,
+                reviewed_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                ACCESS_REQUEST_STATUS_REVOKED,
+                reviewer,
+                reviewer_note,
+                now,
+                now,
+                request_id,
+            ),
+        )
+        _record_audit_event(
+            conn,
+            actor_id=reviewer,
+            action="access_request.revoked",
+            target_type="access_request",
+            target_id=request_id,
+            metadata={"note": reviewer_note},
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM access_requests WHERE id = ?", (request_id,)).fetchone()
+        return _row_to_access_request(row)
+
+
 def start_session(*, user_id: int, host_id: int, protocol: str) -> Dict:
     if protocol not in SUPPORTED_PROTOCOLS:
         raise ValidationError(f"Unsupported protocol '{protocol}'")
@@ -1356,6 +1776,8 @@ def start_session(*, user_id: int, host_id: int, protocol: str) -> Dict:
             if not auth:
                 raise ValidationError("User does not have access to the requested host")
             _enforce_access_window(conn, auth)
+            if bool(auth["requires_approval"]):
+                _enforce_access_request(conn, auth["id"], user_id)
         started_at = datetime.now(tz=timezone.utc).isoformat()
         cursor = conn.execute(
             """
