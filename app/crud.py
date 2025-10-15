@@ -490,21 +490,101 @@ def end_session(
         return _row_to_session(row)
 
 
-def list_sessions() -> List[Dict]:
+def list_sessions(
+    *,
+    user_id: Optional[int] = None,
+    host_id: Optional[int] = None,
+    protocol: Optional[str] = None,
+    only_active: Optional[bool] = None,
+    started_after: Optional[str] = None,
+    started_before: Optional[str] = None,
+) -> List[Dict]:
+    if protocol is not None and protocol not in SUPPORTED_PROTOCOLS:
+        raise ValidationError(f"Unsupported protocol '{protocol}'")
+    clauses: List[str] = []
+    params: List[object] = []
+    if user_id is not None:
+        clauses.append("user_id = ?")
+        params.append(user_id)
+    if host_id is not None:
+        clauses.append("host_id = ?")
+        params.append(host_id)
+    if protocol is not None:
+        clauses.append("protocol = ?")
+        params.append(protocol)
+    if only_active is True:
+        clauses.append("ended_at IS NULL")
+    elif only_active is False:
+        clauses.append("ended_at IS NOT NULL")
+    if started_after is not None:
+        clauses.append("started_at >= ?")
+        params.append(started_after)
+    if started_before is not None:
+        clauses.append("started_at <= ?")
+        params.append(started_before)
+    query = "SELECT * FROM sessions"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY id ASC"
     with get_connection() as conn:
-        rows = conn.execute("SELECT * FROM sessions ORDER BY id ASC").fetchall()
+        rows = conn.execute(query, params).fetchall()
         return [_row_to_session(row) for row in rows]
 
 
-def list_recordings(*, session_id: Optional[int] = None) -> List[Dict]:
+def get_session(record_id: int) -> Dict:
     with get_connection() as conn:
-        if session_id is not None:
-            rows = conn.execute(
-                "SELECT * FROM recordings WHERE session_id = ? ORDER BY id ASC",
-                (session_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM recordings ORDER BY id ASC").fetchall()
+        row = conn.execute("SELECT * FROM sessions WHERE id = ?", (record_id,)).fetchone()
+        if not row:
+            raise ValidationError(f"Session {record_id} not found")
+        session = _row_to_session(row)
+        recordings = conn.execute(
+            "SELECT * FROM recordings WHERE session_id = ? ORDER BY id ASC",
+            (record_id,),
+        ).fetchall()
+        session["recordings"] = [_row_to_recording(recording) for recording in recordings]
+        return session
+
+
+def list_recordings(
+    *,
+    session_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    host_id: Optional[int] = None,
+    protocol: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+) -> List[Dict]:
+    if protocol is not None and protocol not in SUPPORTED_PROTOCOLS:
+        raise ValidationError(f"Unsupported protocol '{protocol}'")
+    clauses: List[str] = []
+    params: List[object] = []
+    join_sessions = any(value is not None for value in (user_id, host_id, protocol))
+    if session_id is not None:
+        clauses.append("recordings.session_id = ?")
+        params.append(session_id)
+    if user_id is not None:
+        clauses.append("sessions.user_id = ?")
+        params.append(user_id)
+    if host_id is not None:
+        clauses.append("sessions.host_id = ?")
+        params.append(host_id)
+    if protocol is not None:
+        clauses.append("sessions.protocol = ?")
+        params.append(protocol)
+    if created_after is not None:
+        clauses.append("recordings.created_at >= ?")
+        params.append(created_after)
+    if created_before is not None:
+        clauses.append("recordings.created_at <= ?")
+        params.append(created_before)
+    query = "SELECT recordings.* FROM recordings"
+    if join_sessions:
+        query += " JOIN sessions ON recordings.session_id = sessions.id"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY recordings.id ASC"
+    with get_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
         return [_row_to_recording(row) for row in rows]
 
 

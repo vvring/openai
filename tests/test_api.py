@@ -363,6 +363,131 @@ def test_user_activation_and_host_updates():
     resp = client.patch(f"/users/{user_id}", json={"roles": ["invalid"]})
     assert resp.status_code == 400
 
+
+def test_session_filters_and_recording_search():
+    admin_payload = {
+        "username": "filter-admin",
+        "full_name": "Filter Admin",
+        "email": "filter-admin@example.com",
+        "roles": ["admin"],
+    }
+    resp = client.post("/users", json=admin_payload)
+    assert resp.status_code == 201
+    admin = resp.json()
+
+    operator_payload = {
+        "username": "filter-op",
+        "full_name": "Filter Operator",
+        "email": "filter-op@example.com",
+        "roles": ["operator"],
+    }
+    resp = client.post("/users", json=operator_payload)
+    assert resp.status_code == 201
+    operator = resp.json()
+
+    host_a_payload = {
+        "name": "audit-linux",
+        "hostname": "10.0.0.50",
+        "port": 22,
+        "operating_system": "linux",
+        "protocols": ["ssh", "sftp"],
+        "tls_enabled": True,
+        "rdp_nla": True,
+    }
+    resp = client.post("/hosts", json=host_a_payload)
+    host_a = resp.json()
+
+    host_b_payload = {
+        "name": "audit-windows",
+        "hostname": "10.0.0.51",
+        "port": 3389,
+        "operating_system": "windows",
+        "protocols": ["rdp"],
+        "tls_enabled": True,
+        "rdp_nla": True,
+    }
+    resp = client.post("/hosts", json=host_b_payload)
+    host_b = resp.json()
+
+    for host in (host_a, host_b):
+        resp = client.post(
+            "/authorizations",
+            json={"user_id": operator["id"], "host_id": host["id"], "privileges": "read-write"},
+        )
+        assert resp.status_code == 204
+
+    resp = client.post(
+        "/sessions",
+        json={"user_id": admin["id"], "host_id": host_a["id"], "protocol": "ssh"},
+    )
+    assert resp.status_code == 201
+    admin_session = resp.json()
+
+    resp = client.post(
+        "/sessions",
+        json={"user_id": operator["id"], "host_id": host_a["id"], "protocol": "ssh"},
+    )
+    assert resp.status_code == 201
+    operator_session_active = resp.json()
+
+    resp = client.post(f"/sessions/{admin_session['id']}/end", json={})
+    assert resp.status_code == 200
+
+    resp = client.post(
+        "/sessions",
+        json={"user_id": operator["id"], "host_id": host_b["id"], "protocol": "rdp"},
+    )
+    assert resp.status_code == 201
+    operator_session_rdp = resp.json()
+
+    resp = client.post(
+        f"/sessions/{operator_session_rdp['id']}/end",
+        json={
+            "recording": {
+                "storage_path": "/recordings/rdp-session.mp4",
+                "size_bytes": 4096,
+                "duration_seconds": 120.0,
+                "checksum": "cafebabe",
+                "metadata": {"codec": "h264"},
+            }
+        },
+    )
+    assert resp.status_code == 200
+
+    resp = client.get(f"/sessions?user_id={operator['id']}")
+    assert resp.status_code == 200
+    assert {session["id"] for session in resp.json()} == {
+        operator_session_active["id"],
+        operator_session_rdp["id"],
+    }
+
+    resp = client.get(f"/sessions?host_id={host_a['id']}&only_active=true")
+    assert resp.status_code == 200
+    sessions = resp.json()
+    assert len(sessions) == 1
+    assert sessions[0]["id"] == operator_session_active["id"]
+
+    resp = client.get(f"/sessions?protocol=rdp&only_active=false")
+    assert resp.status_code == 200
+    rdp_sessions = resp.json()
+    assert len(rdp_sessions) == 1
+    assert rdp_sessions[0]["id"] == operator_session_rdp["id"]
+
+    detail_resp = client.get(f"/sessions/{operator_session_rdp['id']}")
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert detail["id"] == operator_session_rdp["id"]
+    assert detail["recordings"]
+    assert detail["recordings"][0]["storage_path"] == "/recordings/rdp-session.mp4"
+
+    resp = client.get(f"/recordings?user_id={operator['id']}&protocol=rdp")
+    assert resp.status_code == 200
+    filtered_recordings = resp.json()
+    assert len(filtered_recordings) == 1
+    assert filtered_recordings[0]["session_id"] == operator_session_rdp["id"]
+    assert filtered_recordings[0]["metadata"]["codec"] == "h264"
+
+
 @pytest.fixture(autouse=True, scope='module')
 def cleanup_db():
     yield

@@ -1,6 +1,7 @@
 """Bastion management API built on the lightweight FastAPI shim."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, status
@@ -8,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.3.0")
+app = FastAPI(title="Bastion Management Service", version="0.4.0")
 
 
 def _handle_validation_error(func):
@@ -26,6 +27,28 @@ def _parse_int(value, field: str) -> int:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValidationError(f"Field '{field}' must be an integer") from exc
+
+
+def _parse_bool(value, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise ValidationError(f"Field '{field}' must be a boolean")
+
+
+def _parse_datetime(value: str, field: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"Field '{field}' must be an ISO formatted datetime") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
 
 
 @app.post("/users", status_code=status.HTTP_201_CREATED)
@@ -171,17 +194,60 @@ def end_session(record_id: str, payload: Dict) -> Dict:
 
 
 @app.get("/sessions")
-def list_sessions() -> List[Dict]:
-    return crud.list_sessions()
+def list_sessions(
+    user_id: Optional[str] = None,
+    host_id: Optional[str] = None,
+    protocol: Optional[str] = None,
+    only_active: Optional[str] = None,
+    started_after: Optional[str] = None,
+    started_before: Optional[str] = None,
+) -> List[Dict]:
+    params: Dict[str, object] = {}
+    if user_id is not None:
+        params["user_id"] = _parse_int(user_id, "user_id")
+    if host_id is not None:
+        params["host_id"] = _parse_int(host_id, "host_id")
+    if protocol is not None:
+        params["protocol"] = protocol
+    if only_active is not None:
+        params["only_active"] = _parse_bool(only_active, "only_active")
+    if started_after is not None:
+        params["started_after"] = _parse_datetime(started_after, "started_after")
+    if started_before is not None:
+        params["started_before"] = _parse_datetime(started_before, "started_before")
+    return crud.list_sessions(**params)
+
+
+@app.get("/sessions/{session_id}")
+@_handle_validation_error
+def get_session(session_id: str) -> Dict:
+    return crud.get_session(_parse_int(session_id, "session_id"))
 
 
 @app.get("/recordings")
 @_handle_validation_error
-def list_recordings(session_id: Optional[str] = None) -> List[Dict]:
-    parsed_session: Optional[int] = None
+def list_recordings(
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    host_id: Optional[str] = None,
+    protocol: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+) -> List[Dict]:
+    params: Dict[str, object] = {}
     if session_id is not None:
-        parsed_session = _parse_int(session_id, "session_id")
-    return crud.list_recordings(session_id=parsed_session)
+        params["session_id"] = _parse_int(session_id, "session_id")
+    if user_id is not None:
+        params["user_id"] = _parse_int(user_id, "user_id")
+    if host_id is not None:
+        params["host_id"] = _parse_int(host_id, "host_id")
+    if protocol is not None:
+        params["protocol"] = protocol
+    if created_after is not None:
+        params["created_after"] = _parse_datetime(created_after, "created_after")
+    if created_before is not None:
+        params["created_before"] = _parse_datetime(created_before, "created_before")
+    return crud.list_recordings(**params)
 
 
 @app.get("/recordings/{recording_id}")
