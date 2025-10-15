@@ -49,3 +49,14 @@ class SessionRecord:
     ended_at: Optional[datetime] = None
     recording_path: Optional[str] = None
     metadata: Optional[Dict] = None
+
+
+@dataclass(slots=True)
+class AuditEvent:
+    id: int
+    actor_id: int
+    action: str
+    target_type: str
+    target_id: Optional[int]
+    created_at: datetime
+    metadata: Optional[Dict] = None

@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.5.0")
+app = FastAPI(title="Bastion Management Service", version="0.6.0")
 
 
 def _handle_validation_error(func):
@@ -54,11 +54,16 @@ def _parse_datetime(value: str, field: str) -> str:
 @app.post("/users", status_code=status.HTTP_201_CREATED)
 @_handle_validation_error
 def create_user(payload: Dict) -> Dict:
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
     return crud.create_user(
         username=payload.get("username"),
         full_name=payload.get("full_name"),
         email=payload.get("email"),
         roles=payload.get("roles", []),
+        performed_by=parsed_actor,
     )
 
 
@@ -82,12 +87,17 @@ def update_user(user_id: str, payload: Dict) -> Dict:
     is_active = payload.get("is_active")
     if is_active is not None and not isinstance(is_active, bool):
         raise ValidationError("is_active must be a boolean")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
     return crud.update_user(
         _parse_int(user_id, "user_id"),
         full_name=payload.get("full_name"),
         email=payload.get("email"),
         roles=roles,
         is_active=is_active,
+        performed_by=parsed_actor,
     )
 
 
@@ -97,6 +107,10 @@ def create_host(payload: Dict) -> Dict:
     tags = payload.get("tags")
     if tags is not None and not isinstance(tags, list):
         raise ValidationError("tags must be provided as a list")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
     return crud.create_host(
         name=payload.get("name"),
         hostname=payload.get("hostname"),
@@ -108,6 +122,7 @@ def create_host(payload: Dict) -> Dict:
         tags=tags,
         environment=payload.get("environment"),
         business_unit=payload.get("business_unit"),
+        performed_by=parsed_actor,
     )
 
 
@@ -152,6 +167,10 @@ def update_host(host_id: str, payload: Dict) -> Dict:
     tags = payload.get("tags")
     if tags is not None and not isinstance(tags, list):
         raise ValidationError("tags must be provided as a list")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
     return crud.update_host(
         _parse_int(host_id, "host_id"),
         name=payload.get("name"),
@@ -164,6 +183,7 @@ def update_host(host_id: str, payload: Dict) -> Dict:
         tags=tags,
         environment=payload.get("environment"),
         business_unit=payload.get("business_unit"),
+        performed_by=parsed_actor,
     )
 
 
@@ -172,7 +192,16 @@ def update_host(host_id: str, payload: Dict) -> Dict:
 def assign_authorization(payload: Dict):
     user_id = _parse_int(payload.get("user_id"), "user_id")
     host_id = _parse_int(payload.get("host_id"), "host_id")
-    crud.authorize_user(user_id, host_id, payload.get("privileges", "read"))
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    crud.authorize_user(
+        user_id,
+        host_id,
+        payload.get("privileges", "read"),
+        performed_by=parsed_actor,
+    )
     return None
 
 
@@ -190,8 +219,14 @@ def list_authorizations(user_id: Optional[str] = None, host_id: Optional[str] = 
 
 @app.delete("/authorizations/{authorization_id}", status_code=status.HTTP_204_NO_CONTENT)
 @_handle_validation_error
-def delete_authorization(authorization_id: str):
-    crud.revoke_authorization(_parse_int(authorization_id, "authorization_id"))
+def delete_authorization(authorization_id: str, performed_by: Optional[str] = None):
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    crud.revoke_authorization(
+        _parse_int(authorization_id, "authorization_id"),
+        performed_by=parsed_actor,
+    )
     return None
 
 
@@ -277,3 +312,29 @@ def list_recordings(
 @_handle_validation_error
 def get_recording(recording_id: str) -> Dict:
     return crud.get_recording(_parse_int(recording_id, "recording_id"))
+
+
+@app.get("/audit-events")
+@_handle_validation_error
+def list_audit_events(
+    actor_id: Optional[str] = None,
+    action: Optional[str] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+) -> List[Dict]:
+    params: Dict[str, object] = {}
+    if actor_id is not None:
+        params["actor_id"] = _parse_int(actor_id, "actor_id")
+    if action is not None:
+        params["action"] = action
+    if target_type is not None:
+        params["target_type"] = target_type
+    if target_id is not None:
+        params["target_id"] = _parse_int(target_id, "target_id")
+    if created_after is not None:
+        params["created_after"] = _parse_datetime(created_after, "created_after")
+    if created_before is not None:
+        params["created_before"] = _parse_datetime(created_before, "created_before")
+    return crud.list_audit_events(**params)

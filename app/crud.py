@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .database import get_connection
 from .models import (
@@ -95,6 +95,19 @@ def _row_to_recording(row) -> Dict:
     }
 
 
+def _row_to_audit_event(row) -> Dict:
+    metadata = _json_loads(row["metadata"]) if row["metadata"] else None
+    return {
+        "id": row["id"],
+        "actor_id": row["actor_id"],
+        "action": row["action"],
+        "target_type": row["target_type"],
+        "target_id": row["target_id"],
+        "metadata": metadata,
+        "created_at": row["created_at"],
+    }
+
+
 def _validate_roles(roles: List[str]) -> None:
     allowed = {ROLE_ADMIN, ROLE_AUDITOR, ROLE_OPERATOR}
     for role in roles:
@@ -149,21 +162,86 @@ def _normalize_tags(tags: Optional[List[str]]) -> List[str]:
     return deduped
 
 
-def create_user(*, username: str, full_name: str, email: str, roles: List[str] | None = None) -> Dict:
+def _ensure_actor(conn: sqlite3.Connection, actor_id: Optional[int]) -> Optional[int]:
+    if actor_id is None:
+        return None
+    try:
+        actor_int = int(actor_id)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("performed_by must be an integer") from exc
+    row = conn.execute("SELECT id FROM users WHERE id = ?", (actor_int,)).fetchone()
+    if not row:
+        raise ValidationError(f"Actor user {actor_int} not found")
+    return actor_int
+
+
+def _record_audit_event(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: Optional[int],
+    action: str,
+    target_type: str,
+    target_id: Optional[int],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    if actor_id is None:
+        return
+    if not action:
+        raise ValidationError("Audit events require an action description")
+    if not target_type:
+        raise ValidationError("Audit events require a target_type")
+    created_at = datetime.now(tz=timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO audit_events (actor_id, action, target_type, target_id, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            actor_id,
+            action,
+            target_type,
+            target_id,
+            json.dumps(metadata) if metadata is not None else None,
+            created_at,
+        ),
+    )
+
+
+def create_user(
+    *,
+    username: str,
+    full_name: str,
+    email: str,
+    roles: List[str] | None = None,
+    performed_by: Optional[int] = None,
+) -> Dict:
     if not username or not full_name or not email:
         raise ValidationError("username, full_name and email are required")
     roles = roles or []
     _validate_roles(roles)
     with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
         try:
             cursor = conn.execute(
                 "INSERT INTO users (username, full_name, email, roles) VALUES (?, ?, ?, ?)",
                 (username, full_name, email, json.dumps(roles)),
             )
-            conn.commit()
         except sqlite3.IntegrityError as exc:
             raise ValidationError("Username already exists") from exc
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        user_id = cursor.lastrowid
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="user.created",
+            target_type="user",
+            target_id=user_id,
+            metadata={
+                "username": username,
+                "roles": roles,
+            },
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         return _row_to_user(row)
 
 
@@ -188,6 +266,7 @@ def update_user(
     email: Optional[str] = None,
     roles: Optional[List[str]] = None,
     is_active: Optional[bool] = None,
+    performed_by: Optional[int] = None,
 ) -> Dict:
     if roles is not None:
         if not isinstance(roles, list):
@@ -198,28 +277,42 @@ def update_user(
     if email is not None and not email:
         raise ValidationError("email cannot be empty")
     with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         if not row:
             raise ValidationError(f"User {user_id} not found")
         updates: List[str] = []
         params: List[object] = []
+        changes: Dict[str, Any] = {}
         if full_name is not None:
             updates.append("full_name = ?")
             params.append(full_name)
+            changes["full_name"] = full_name
         if email is not None:
             updates.append("email = ?")
             params.append(email)
+            changes["email"] = email
         if roles is not None:
             updates.append("roles = ?")
             params.append(json.dumps(roles))
+            changes["roles"] = roles
         if is_active is not None:
             updates.append("is_active = ?")
             params.append(int(bool(is_active)))
+            changes["is_active"] = bool(is_active)
         if not updates:
             raise ValidationError("No fields provided for update")
         conn.execute(
             f"UPDATE users SET {', '.join(updates)} WHERE id = ?",
             (*params, user_id),
+        )
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="user.updated",
+            target_type="user",
+            target_id=user_id,
+            metadata=changes,
         )
         conn.commit()
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -238,6 +331,7 @@ def create_host(
     tags: Optional[List[str]] = None,
     environment: Optional[str] = None,
     business_unit: Optional[str] = None,
+    performed_by: Optional[int] = None,
 ) -> Dict:
     if not name or not hostname or not operating_system:
         raise ValidationError("name, hostname and operating_system are required")
@@ -248,6 +342,7 @@ def create_host(
     _validate_environment(environment)
     normalized_tags = _normalize_tags(tags)
     with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
         try:
             cursor = conn.execute(
                 """
@@ -278,10 +373,24 @@ def create_host(
                     business_unit,
                 ),
             )
-            conn.commit()
         except sqlite3.IntegrityError as exc:
             raise ValidationError("Host already exists") from exc
-        row = conn.execute("SELECT * FROM hosts WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        host_id = cursor.lastrowid
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="host.created",
+            target_type="host",
+            target_id=host_id,
+            metadata={
+                "name": name,
+                "protocols": protocols,
+                "environment": environment,
+                "tags": normalized_tags,
+            },
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
         return _row_to_host(row)
 
 
@@ -335,6 +444,7 @@ def update_host(
     tags: Optional[List[str]] = None,
     environment: Optional[str] = None,
     business_unit: Optional[str] = None,
+    performed_by: Optional[int] = None,
 ) -> Dict:
     if port is not None:
         if not isinstance(port, int) or port <= 0:
@@ -352,43 +462,55 @@ def update_host(
     _validate_environment(environment)
     normalized_tags = _normalize_tags(tags) if tags is not None else None
     with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
         row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
         if not row:
             raise ValidationError(f"Host {host_id} not found")
         updates: List[str] = []
         params: List[object] = []
+        changes: Dict[str, Any] = {}
         if name is not None:
             updates.append("name = ?")
             params.append(name)
+            changes["name"] = name
         if hostname is not None:
             updates.append("hostname = ?")
             params.append(hostname)
+            changes["hostname"] = hostname
         if port is not None:
             updates.append("port = ?")
             params.append(port)
+            changes["port"] = port
         if operating_system is not None:
             updates.append("operating_system = ?")
             params.append(operating_system)
+            changes["operating_system"] = operating_system
         effective_protocols = protocols if protocols is not None else _json_loads(row["protocols"]) or []
         if protocols is not None:
             updates.append("protocols = ?")
             params.append(json.dumps(protocols))
+            changes["protocols"] = protocols
         effective_rdp_nla = bool(row["rdp_nla"]) if rdp_nla is None else bool(rdp_nla)
         if rdp_nla is not None:
             updates.append("rdp_nla = ?")
             params.append(int(bool(rdp_nla)))
+            changes["rdp_nla"] = bool(rdp_nla)
         if tls_enabled is not None:
             updates.append("tls_enabled = ?")
             params.append(int(bool(tls_enabled)))
+            changes["tls_enabled"] = bool(tls_enabled)
         if normalized_tags is not None:
             updates.append("tags = ?")
             params.append(json.dumps(normalized_tags))
+            changes["tags"] = normalized_tags
         if environment is not None:
             updates.append("environment = ?")
             params.append(environment)
+            changes["environment"] = environment
         if business_unit is not None:
             updates.append("business_unit = ?")
             params.append(business_unit)
+            changes["business_unit"] = business_unit
         if "rdp" in effective_protocols and not effective_rdp_nla:
             raise ValidationError("Hosts exposing RDP must enable NLA")
         if not updates:
@@ -400,22 +522,41 @@ def update_host(
             )
         except sqlite3.IntegrityError as exc:
             raise ValidationError("Host already exists") from exc
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="host.updated",
+            target_type="host",
+            target_id=host_id,
+            metadata=changes,
+        )
         conn.commit()
         row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
         return _row_to_host(row)
 
 
-def authorize_user(user_id: int, host_id: int, privileges: str) -> None:
+def authorize_user(
+    user_id: int,
+    host_id: int,
+    privileges: str,
+    *,
+    performed_by: Optional[int] = None,
+) -> None:
     if not privileges:
         raise ValidationError("privileges must be provided")
     _validate_privileges(privileges)
     with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
         user = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
         host = conn.execute("SELECT id FROM hosts WHERE id = ?", (host_id,)).fetchone()
         if not user:
             raise ValidationError(f"User {user_id} not found")
         if not host:
             raise ValidationError(f"Host {host_id} not found")
+        existing = conn.execute(
+            "SELECT * FROM authorizations WHERE user_id = ? AND host_id = ?",
+            (user_id, host_id),
+        ).fetchone()
         conn.execute(
             """
             INSERT INTO authorizations (user_id, host_id, privileges)
@@ -423,6 +564,19 @@ def authorize_user(user_id: int, host_id: int, privileges: str) -> None:
             ON CONFLICT(user_id, host_id) DO UPDATE SET privileges = excluded.privileges
             """,
             (user_id, host_id, privileges),
+        )
+        row = conn.execute(
+            "SELECT * FROM authorizations WHERE user_id = ? AND host_id = ?",
+            (user_id, host_id),
+        ).fetchone()
+        action = "authorization.updated" if existing else "authorization.granted"
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action=action,
+            target_type="authorization",
+            target_id=row["id"] if row else None,
+            metadata={"privileges": privileges},
         )
         conn.commit()
 
@@ -445,14 +599,27 @@ def list_authorizations(*, user_id: Optional[int] = None, host_id: Optional[int]
         return [_row_to_authorization(row) for row in rows]
 
 
-def revoke_authorization(authorization_id: int) -> None:
+def revoke_authorization(authorization_id: int, *, performed_by: Optional[int] = None) -> None:
     with get_connection() as conn:
-        cursor = conn.execute(
+        actor_id = _ensure_actor(conn, performed_by)
+        row = conn.execute(
+            "SELECT * FROM authorizations WHERE id = ?",
+            (authorization_id,),
+        ).fetchone()
+        if not row:
+            raise ValidationError(f"Authorization {authorization_id} not found")
+        conn.execute(
             "DELETE FROM authorizations WHERE id = ?",
             (authorization_id,),
         )
-        if cursor.rowcount == 0:
-            raise ValidationError(f"Authorization {authorization_id} not found")
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="authorization.revoked",
+            target_type="authorization",
+            target_id=authorization_id,
+            metadata={"user_id": row["user_id"], "host_id": row["host_id"]},
+        )
         conn.commit()
 
 
@@ -487,8 +654,17 @@ def start_session(*, user_id: int, host_id: int, protocol: str) -> Dict:
             """,
             (user_id, host_id, protocol, started_at),
         )
+        session_id = cursor.lastrowid
+        _record_audit_event(
+            conn,
+            actor_id=user_id,
+            action="session.started",
+            target_type="session",
+            target_id=session_id,
+            metadata={"host_id": host_id, "protocol": protocol},
+        )
         conn.commit()
-        row = conn.execute("SELECT * FROM sessions WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
         return _row_to_session(row)
 
 
@@ -583,6 +759,21 @@ def end_session(
                     json.dumps(recording_payload["metadata"]) if recording_payload["metadata"] else None,
                 ),
             )
+        audit_metadata: Dict[str, Any] = {
+            "host_id": row["host_id"],
+            "recording_path": recording_path,
+            "recording_created": bool(recording_payload),
+        }
+        if recording_payload and recording_payload.get("checksum"):
+            audit_metadata["checksum"] = recording_payload["checksum"]
+        _record_audit_event(
+            conn,
+            actor_id=row["user_id"],
+            action="session.ended",
+            target_type="session",
+            target_id=record_id,
+            metadata=audit_metadata,
+        )
         conn.commit()
         row = conn.execute("SELECT * FROM sessions WHERE id = ?", (record_id,)).fetchone()
         return _row_to_session(row)
@@ -695,3 +886,41 @@ def get_recording(recording_id: int) -> Dict:
         if not row:
             raise ValidationError(f"Recording {recording_id} not found")
         return _row_to_recording(row)
+
+
+def list_audit_events(
+    *,
+    actor_id: Optional[int] = None,
+    action: Optional[str] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[int] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+) -> List[Dict]:
+    clauses: List[str] = []
+    params: List[object] = []
+    if actor_id is not None:
+        clauses.append("actor_id = ?")
+        params.append(actor_id)
+    if action is not None:
+        clauses.append("action = ?")
+        params.append(action)
+    if target_type is not None:
+        clauses.append("target_type = ?")
+        params.append(target_type)
+    if target_id is not None:
+        clauses.append("target_id = ?")
+        params.append(target_id)
+    if created_after is not None:
+        clauses.append("created_at >= ?")
+        params.append(created_after)
+    if created_before is not None:
+        clauses.append("created_at <= ?")
+        params.append(created_before)
+    query = "SELECT * FROM audit_events"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY id DESC"
+    with get_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [_row_to_audit_event(row) for row in rows]

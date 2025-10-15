@@ -110,6 +110,25 @@ def init_db() -> None:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_recordings_session_id ON recordings(session_id)"
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id INTEGER,
+                metadata TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_target ON audit_events(target_type, target_id)"
+        )
         conn.commit()
 
 

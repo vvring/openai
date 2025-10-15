@@ -19,12 +19,12 @@ client = TestClient(app)
 @pytest.fixture(autouse=True)
 def fresh_database():
     with get_connection() as conn:
-        for table in ("recordings", "sessions", "authorizations", "hosts", "users"):
+        for table in ("audit_events", "recordings", "sessions", "authorizations", "hosts", "users"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
     yield
     with get_connection() as conn:
-        for table in ("recordings", "sessions", "authorizations", "hosts", "users"):
+        for table in ("audit_events", "recordings", "sessions", "authorizations", "hosts", "users"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
 
@@ -279,6 +279,106 @@ def test_protocol_and_nla_enforcement():
         json={"user_id": admin_id, "host_id": host_id, "protocol": "ssh"},
     )
     assert resp.status_code == 201, resp.text
+
+
+def test_audit_event_catalog():
+    admin_payload = {
+        "username": "admin",
+        "full_name": "Primary Admin",
+        "email": "admin@example.com",
+        "roles": ["admin"],
+    }
+    resp = client.post("/users", json=admin_payload)
+    assert resp.status_code == 201
+    admin_id = resp.json()["id"]
+
+    operator_payload = {
+        "username": "operator",
+        "full_name": "Ops User",
+        "email": "ops@example.com",
+        "roles": ["operator"],
+        "performed_by": admin_id,
+    }
+    resp = client.post("/users", json=operator_payload)
+    assert resp.status_code == 201
+    operator_id = resp.json()["id"]
+
+    resp = client.patch(
+        f"/users/{operator_id}",
+        json={"email": "ops+updated@example.com", "performed_by": admin_id},
+    )
+    assert resp.status_code == 200
+
+    host_payload = {
+        "name": "audit-host",
+        "hostname": "10.0.0.40",
+        "port": 22,
+        "operating_system": "linux",
+        "protocols": ["ssh", "rdp"],
+        "tls_enabled": True,
+        "rdp_nla": True,
+        "performed_by": admin_id,
+    }
+    resp = client.post("/hosts", json=host_payload)
+    assert resp.status_code == 201
+    host_id = resp.json()["id"]
+
+    resp = client.post(
+        "/authorizations",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "privileges": "read-write",
+            "performed_by": admin_id,
+        },
+    )
+    assert resp.status_code == 204
+
+    resp = client.get(f"/authorizations?user_id={operator_id}")
+    authorization_id = resp.json()[0]["id"]
+
+    resp = client.post(
+        "/sessions",
+        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+    )
+    assert resp.status_code == 201
+    session_id = resp.json()["id"]
+
+    resp = client.post(
+        f"/sessions/{session_id}/end",
+        json={"metadata": {"ended": True}},
+    )
+    assert resp.status_code == 200
+
+    resp = client.delete(
+        f"/authorizations/{authorization_id}?performed_by={admin_id}"
+    )
+    assert resp.status_code == 204
+
+    resp = client.get(f"/audit-events?actor_id={admin_id}")
+    assert resp.status_code == 200
+    admin_events = resp.json()
+    actions = {event["action"] for event in admin_events}
+    assert {
+        "user.created",
+        "user.updated",
+        "host.created",
+        "authorization.granted",
+        "authorization.revoked",
+    }.issubset(actions)
+    grant_event = next(event for event in admin_events if event["action"] == "authorization.granted")
+    assert grant_event["metadata"]["privileges"] == "read-write"
+
+    resp = client.get(f"/audit-events?target_type=session&target_id={session_id}")
+    assert resp.status_code == 200
+    session_events = resp.json()
+    assert {event["action"] for event in session_events} == {
+        "session.started",
+        "session.ended",
+    }
+    ended_event = next(event for event in session_events if event["action"] == "session.ended")
+    assert ended_event["metadata"]["recording_created"] is False
+    assert ended_event["metadata"]["host_id"] == host_id
 
 
 def test_user_activation_and_host_updates():
