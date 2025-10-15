@@ -20,6 +20,8 @@ from .models import (
     ACCESS_REQUEST_STATUS_DENIED,
     ACCESS_REQUEST_STATUS_PENDING,
     ACCESS_REQUEST_STATUS_REVOKED,
+    GATEWAY_HEALTH_STATUSES,
+    GATEWAY_HEALTH_STATUS_UNKNOWN,
     ROLE_ADMIN,
     ROLE_AUDITOR,
     ROLE_OPERATOR,
@@ -56,7 +58,12 @@ def _row_to_user(row) -> Dict:
     }
 
 
-def _row_to_host(row, *, groups: Optional[List[Dict]] = None) -> Dict:
+def _row_to_host(
+    row,
+    *,
+    groups: Optional[List[Dict]] = None,
+    gateways: Optional[List[Dict]] = None,
+) -> Dict:
     protocols = _json_loads(row["protocols"])
     columns = set(row.keys())
     tags = _json_loads(row["tags"]) if "tags" in columns else None
@@ -73,6 +80,7 @@ def _row_to_host(row, *, groups: Optional[List[Dict]] = None) -> Dict:
         "environment": row["environment"] if "environment" in columns else None,
         "business_unit": row["business_unit"] if "business_unit" in columns else None,
         "groups": groups if groups is not None else [],
+        "gateways": gateways if gateways is not None else [],
     }
 
 
@@ -91,6 +99,42 @@ def _row_to_host_group_summary(row) -> Dict:
         "name": row["name"],
         "description": row["description"],
     }
+
+
+def _row_to_protocol_gateway(row) -> Dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "protocol": row["protocol"],
+        "endpoint_host": row["endpoint_host"],
+        "endpoint_port": row["endpoint_port"],
+        "tls_enabled": bool(row["tls_enabled"]),
+        "nla_required": bool(row["nla_required"]),
+        "is_active": bool(row["is_active"]),
+        "description": row["description"],
+        "last_health_status": row["last_health_status"],
+        "last_health_message": row["last_health_message"],
+        "last_health_at": row["last_health_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_gateway_binding(
+    row,
+    *,
+    gateway: Optional[Dict] = None,
+) -> Dict:
+    binding = {
+        "host_id": row["host_id"],
+        "protocol": row["protocol"],
+        "gateway_id": row["gateway_id"],
+        "assigned_at": row["created_at"],
+        "assigned_by": row["created_by"],
+    }
+    if gateway is not None:
+        binding["gateway"] = gateway
+    return binding
 
 
 def _row_to_authorization(row) -> Dict:
@@ -385,6 +429,14 @@ def _validate_protocols(protocols: List[str]) -> None:
             raise ValidationError(f"Unsupported protocol '{proto}'")
 
 
+def _validate_gateway_health_status(status: str) -> str:
+    if status not in GATEWAY_HEALTH_STATUSES:
+        raise ValidationError(
+            f"Unsupported health status '{status}'. Supported values: {sorted(GATEWAY_HEALTH_STATUSES)}"
+        )
+    return status
+
+
 def _validate_privileges(privileges: str) -> None:
     if privileges not in SUPPORTED_PRIVILEGES:
         raise ValidationError(f"Unsupported privileges '{privileges}'")
@@ -540,6 +592,88 @@ def _ensure_host(conn: sqlite3.Connection, host_id: int):
     return row
 
 
+def _ensure_protocol_gateway(conn: sqlite3.Connection, gateway_id: int):
+    row = conn.execute(
+        "SELECT * FROM protocol_gateways WHERE id = ?",
+        (gateway_id,),
+    ).fetchone()
+    if not row:
+        raise ValidationError(f"Protocol gateway {gateway_id} not found")
+    return row
+
+
+def _map_host_gateways(conn: sqlite3.Connection, host_ids: List[int]) -> Dict[int, List[Dict]]:
+    if not host_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(host_ids))
+    binding_rows = conn.execute(
+        f"""
+        SELECT host_id, protocol, gateway_id, created_at, created_by
+        FROM host_gateway_bindings
+        WHERE host_id IN ({placeholders})
+        ORDER BY host_id ASC, protocol ASC
+        """,
+        tuple(host_ids),
+    ).fetchall()
+    if not binding_rows:
+        return {}
+    gateway_ids = {row["gateway_id"] for row in binding_rows}
+    placeholders = ",".join(["?"] * len(gateway_ids))
+    gateway_rows = conn.execute(
+        f"SELECT * FROM protocol_gateways WHERE id IN ({placeholders})",
+        tuple(gateway_ids),
+    ).fetchall()
+    gateway_map = {row["id"]: _row_to_protocol_gateway(row) for row in gateway_rows}
+    result: Dict[int, List[Dict]] = {}
+    for binding_row in binding_rows:
+        gateway = gateway_map.get(binding_row["gateway_id"])
+        if gateway is None:
+            continue
+        entry = _row_to_gateway_binding(binding_row, gateway=gateway)
+        result.setdefault(binding_row["host_id"], []).append(entry)
+    return result
+
+
+def _get_gateway_binding(
+    conn: sqlite3.Connection, host_id: int, protocol: str
+) -> Optional[Dict]:
+    row = conn.execute(
+        """
+        SELECT host_id, protocol, gateway_id, created_at, created_by
+        FROM host_gateway_bindings
+        WHERE host_id = ? AND protocol = ?
+        """,
+        (host_id, protocol),
+    ).fetchone()
+    if not row:
+        return None
+    gateway_row = _ensure_protocol_gateway(conn, row["gateway_id"])
+    gateway = _row_to_protocol_gateway(gateway_row)
+    return _row_to_gateway_binding(row, gateway=gateway)
+
+
+def _require_gateway_binding(
+    conn: sqlite3.Connection,
+    host_id: int,
+    protocol: str,
+) -> Dict:
+    binding = _get_gateway_binding(conn, host_id, protocol)
+    if binding is None:
+        raise ValidationError(
+            "Host protocol requires a registered gateway before sessions can start"
+        )
+    gateway = binding.get("gateway")
+    if not gateway:
+        raise ValidationError("Assigned gateway could not be loaded")
+    if not gateway["is_active"]:
+        raise ValidationError("Assigned protocol gateway is not active")
+    if protocol == "rdp" and not gateway["nla_required"]:
+        raise ValidationError("Assigned RDP gateway must require NLA")
+    if protocol in {"ssh", "sftp", "rdp"} and not gateway["tls_enabled"]:
+        raise ValidationError("Assigned gateway must have TLS enabled for this protocol")
+    return binding
+
+
 def _ensure_session(conn: sqlite3.Connection, session_id: int):
     row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
     if not row:
@@ -653,6 +787,7 @@ def _build_connection_instructions(
     host_row,
     credential_row,
     protocol: str,
+    gateway: Optional[Dict] = None,
 ) -> Dict:
     secret = credential_row["secret"] or ""
     preview = secret[-4:] if secret else None
@@ -661,11 +796,26 @@ def _build_connection_instructions(
     port = host_row["port"]
     username = credential_row["username"]
     command: Optional[str] = None
+    gateway_host: Optional[str] = None
+    gateway_port: Optional[int] = None
+    if gateway is not None:
+        gateway_host = gateway.get("endpoint_host")
+        gateway_port = gateway.get("endpoint_port")
     if protocol == "ssh":
-        command = f"ssh {username}@{hostname} -p {port}"
+        if gateway_host and gateway_port:
+            command = f"ssh -J {gateway_host}:{gateway_port} {username}@{hostname} -p {port}"
+            notes.append("Connection will traverse the registered protocol gateway via ProxyJump (-J).")
+        else:
+            command = f"ssh {username}@{hostname} -p {port}"
         notes.append("Verify host key fingerprint before accepting the SSH connection.")
     elif protocol == "sftp":
-        command = f"sftp -P {port} {username}@{hostname}"
+        if gateway_host and gateway_port:
+            command = (
+                f"sftp -o ProxyJump={gateway_host}:{gateway_port} -P {port} {username}@{hostname}"
+            )
+            notes.append("SFTP will tunnel via the registered protocol gateway using ProxyJump.")
+        else:
+            command = f"sftp -P {port} {username}@{hostname}"
         notes.append("Use the bastion recording agent if file transfer sessions require capture.")
     elif protocol == "vnc":
         command = f"vncviewer {hostname}::{port}"
@@ -696,6 +846,15 @@ def _build_connection_instructions(
         "command": command,
         "notes": notes,
     }
+    if gateway is not None:
+        instructions["gateway"] = {
+            "id": gateway["id"],
+            "name": gateway["name"],
+            "endpoint_host": gateway["endpoint_host"],
+            "endpoint_port": gateway["endpoint_port"],
+            "tls_enabled": gateway["tls_enabled"],
+            "nla_required": gateway["nla_required"],
+        }
     return instructions
 
 
@@ -1242,8 +1401,14 @@ def list_hosts(
         rows = conn.execute("SELECT * FROM hosts ORDER BY id ASC").fetchall()
         host_ids = [row["id"] for row in rows]
         groups_map = _map_host_groups(conn, host_ids)
+        gateways_map = _map_host_gateways(conn, host_ids)
         hosts = [
-            _row_to_host(row, groups=groups_map.get(row["id"], [])) for row in rows
+            _row_to_host(
+                row,
+                groups=groups_map.get(row["id"], []),
+                gateways=gateways_map.get(row["id"], []),
+            )
+            for row in rows
         ]
     if environment is not None:
         hosts = [host for host in hosts if host["environment"] == environment]
@@ -1271,7 +1436,12 @@ def get_host(host_id: int) -> Dict:
         if not row:
             raise ValidationError(f"Host {host_id} not found")
         groups_map = _map_host_groups(conn, [host_id])
-        return _row_to_host(row, groups=groups_map.get(host_id, []))
+        gateways_map = _map_host_gateways(conn, [host_id])
+        return _row_to_host(
+            row,
+            groups=groups_map.get(host_id, []),
+            gateways=gateways_map.get(host_id, []),
+        )
 
 
 def update_host(
@@ -1376,7 +1546,389 @@ def update_host(
         conn.commit()
         row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
         groups_map = _map_host_groups(conn, [host_id])
-        return _row_to_host(row, groups=groups_map.get(host_id, []))
+        gateways_map = _map_host_gateways(conn, [host_id])
+        return _row_to_host(
+            row,
+            groups=groups_map.get(host_id, []),
+            gateways=gateways_map.get(host_id, []),
+        )
+
+
+def create_protocol_gateway(
+    *,
+    name: str,
+    protocol: str,
+    endpoint_host: str,
+    endpoint_port: int,
+    tls_enabled: bool = True,
+    nla_required: bool = False,
+    description: Optional[str] = None,
+    is_active: bool = True,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    normalized_name = _require_non_empty_string(name, "name", max_length=200)
+    if not isinstance(protocol, str) or protocol.strip().lower() not in SUPPORTED_PROTOCOLS:
+        raise ValidationError("protocol must reference a supported protocol")
+    normalized_protocol = protocol.strip().lower()
+    endpoint = _require_non_empty_string(endpoint_host, "endpoint_host", max_length=255)
+    if not isinstance(endpoint_port, int) or endpoint_port <= 0:
+        raise ValidationError("endpoint_port must be a positive integer")
+    tls_flag = bool(tls_enabled)
+    nla_flag = bool(nla_required) if normalized_protocol == "rdp" else False
+    if normalized_protocol == "rdp" and not nla_flag:
+        raise ValidationError("RDP gateways must require NLA")
+    if normalized_protocol in {"ssh", "sftp", "rdp"} and not tls_flag:
+        raise ValidationError("TLS must be enabled for SSH, SFTP and RDP gateways")
+    cleaned_description: Optional[str] = None
+    if description is not None:
+        if description != "" and not isinstance(description, str):
+            raise ValidationError("description must be a string if provided")
+        cleaned_description = description.strip() if isinstance(description, str) else None
+    now = datetime.now(tz=timezone.utc).isoformat()
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO protocol_gateways (
+                    name,
+                    protocol,
+                    endpoint_host,
+                    endpoint_port,
+                    tls_enabled,
+                    nla_required,
+                    is_active,
+                    description,
+                    last_health_status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_name,
+                    normalized_protocol,
+                    endpoint,
+                    endpoint_port,
+                    int(tls_flag),
+                    int(nla_flag),
+                    int(bool(is_active)),
+                    cleaned_description,
+                    GATEWAY_HEALTH_STATUS_UNKNOWN,
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("Protocol gateway already exists") from exc
+        gateway_id = cursor.lastrowid
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="protocol_gateway.created",
+            target_type="protocol_gateway",
+            target_id=gateway_id,
+            metadata={
+                "name": normalized_name,
+                "protocol": normalized_protocol,
+                "endpoint_host": endpoint,
+                "endpoint_port": endpoint_port,
+            },
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM protocol_gateways WHERE id = ?",
+            (gateway_id,),
+        ).fetchone()
+        return _row_to_protocol_gateway(row)
+
+
+def list_protocol_gateways(
+    *,
+    protocol: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> List[Dict]:
+    _validate_pagination(limit, offset)
+    normalized_protocol: Optional[str] = None
+    if protocol is not None:
+        if not isinstance(protocol, str):
+            raise ValidationError("protocol must be a string")
+        lowered = protocol.strip().lower()
+        if lowered not in SUPPORTED_PROTOCOLS:
+            raise ValidationError(f"Unsupported protocol '{protocol}'")
+        normalized_protocol = lowered
+    with get_connection() as conn:
+        query = "SELECT * FROM protocol_gateways"
+        clauses: List[str] = []
+        params: List[Any] = []
+        if normalized_protocol is not None:
+            clauses.append("protocol = ?")
+            params.append(normalized_protocol)
+        if is_active is True:
+            clauses.append("is_active = 1")
+        elif is_active is False:
+            clauses.append("is_active = 0")
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id ASC"
+        query, params = _apply_pagination(query, params, limit, offset)
+        rows = conn.execute(query, tuple(params)).fetchall()
+        return [_row_to_protocol_gateway(row) for row in rows]
+
+
+def get_protocol_gateway(gateway_id: int) -> Dict:
+    with get_connection() as conn:
+        row = _ensure_protocol_gateway(conn, gateway_id)
+        return _row_to_protocol_gateway(row)
+
+
+def update_protocol_gateway(
+    gateway_id: int,
+    *,
+    endpoint_host: Optional[str] = None,
+    endpoint_port: Optional[int] = None,
+    tls_enabled: Optional[bool] = None,
+    nla_required: Optional[bool] = None,
+    description: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    updates: List[str] = []
+    params: List[Any] = []
+    metadata: Dict[str, Any] = {}
+    if endpoint_host is not None:
+        cleaned = _require_non_empty_string(endpoint_host, "endpoint_host", max_length=255)
+        updates.append("endpoint_host = ?")
+        params.append(cleaned)
+        metadata["endpoint_host"] = cleaned
+    if endpoint_port is not None:
+        if not isinstance(endpoint_port, int) or endpoint_port <= 0:
+            raise ValidationError("endpoint_port must be a positive integer")
+        updates.append("endpoint_port = ?")
+        params.append(endpoint_port)
+        metadata["endpoint_port"] = endpoint_port
+    if tls_enabled is not None:
+        updates.append("tls_enabled = ?")
+        params.append(int(bool(tls_enabled)))
+        metadata["tls_enabled"] = bool(tls_enabled)
+    if nla_required is not None:
+        updates.append("nla_required = ?")
+        params.append(int(bool(nla_required)))
+        metadata["nla_required"] = bool(nla_required)
+    cleaned_description: Optional[str] = None
+    if description is not None:
+        if description != "" and not isinstance(description, str):
+            raise ValidationError("description must be a string if provided")
+        cleaned_description = description.strip() if isinstance(description, str) else None
+        updates.append("description = ?")
+        params.append(cleaned_description)
+        metadata["description"] = cleaned_description
+    if is_active is not None:
+        updates.append("is_active = ?")
+        params.append(int(bool(is_active)))
+        metadata["is_active"] = bool(is_active)
+    if not updates:
+        raise ValidationError("No fields provided for update")
+    now = datetime.now(tz=timezone.utc).isoformat()
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        row = _ensure_protocol_gateway(conn, gateway_id)
+        if "nla_required" in metadata and row["protocol"] != "rdp":
+            raise ValidationError("Only RDP gateways support NLA requirements")
+        if row["protocol"] in {"ssh", "sftp", "rdp"} and metadata.get("tls_enabled") is False:
+            raise ValidationError("TLS must remain enabled for SSH, SFTP and RDP gateways")
+        if row["protocol"] == "rdp":
+            nla_effective = metadata.get("nla_required", bool(row["nla_required"]))
+            if not nla_effective:
+                raise ValidationError("RDP gateways must require NLA")
+        updates.append("updated_at = ?")
+        params.append(now)
+        params.append(gateway_id)
+        try:
+            conn.execute(
+                f"UPDATE protocol_gateways SET {', '.join(updates)} WHERE id = ?",
+                tuple(params),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("Protocol gateway update failed") from exc
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="protocol_gateway.updated",
+            target_type="protocol_gateway",
+            target_id=gateway_id,
+            metadata=metadata,
+        )
+        conn.commit()
+        updated_row = conn.execute(
+            "SELECT * FROM protocol_gateways WHERE id = ?",
+            (gateway_id,),
+        ).fetchone()
+        return _row_to_protocol_gateway(updated_row)
+
+
+def record_protocol_gateway_health(
+    gateway_id: int,
+    *,
+    status: str,
+    message: Optional[str] = None,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    normalized_status = _validate_gateway_health_status(status.strip().lower())
+    cleaned_message: Optional[str] = None
+    if message is not None:
+        if not isinstance(message, str):
+            raise ValidationError("message must be a string")
+        cleaned_message = message.strip() or None
+        if cleaned_message is not None and len(cleaned_message) > 500:
+            raise ValidationError("message cannot exceed 500 characters")
+    now = datetime.now(tz=timezone.utc).isoformat()
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        _ensure_protocol_gateway(conn, gateway_id)
+        conn.execute(
+            """
+            UPDATE protocol_gateways
+            SET last_health_status = ?,
+                last_health_message = ?,
+                last_health_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (normalized_status, cleaned_message, now, now, gateway_id),
+        )
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="protocol_gateway.health_reported",
+            target_type="protocol_gateway",
+            target_id=gateway_id,
+            metadata={"status": normalized_status, "message": cleaned_message},
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM protocol_gateways WHERE id = ?",
+            (gateway_id,),
+        ).fetchone()
+        return _row_to_protocol_gateway(row)
+
+
+def delete_protocol_gateway(
+    gateway_id: int,
+    *,
+    performed_by: Optional[int] = None,
+) -> None:
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        row = _ensure_protocol_gateway(conn, gateway_id)
+        binding_count = conn.execute(
+            "SELECT COUNT(*) FROM host_gateway_bindings WHERE gateway_id = ?",
+            (gateway_id,),
+        ).fetchone()[0]
+        if binding_count:
+            raise ValidationError("Gateway remains assigned to hosts and cannot be removed")
+        conn.execute("DELETE FROM protocol_gateways WHERE id = ?", (gateway_id,))
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="protocol_gateway.deleted",
+            target_type="protocol_gateway",
+            target_id=gateway_id,
+            metadata={"name": row["name"], "protocol": row["protocol"]},
+        )
+        conn.commit()
+
+
+def assign_gateway_to_host(
+    *,
+    host_id: int,
+    protocol: str,
+    gateway_id: int,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    if not isinstance(protocol, str):
+        raise ValidationError("protocol must be a string")
+    normalized_protocol = protocol.strip().lower()
+    if normalized_protocol not in SUPPORTED_PROTOCOLS:
+        raise ValidationError(f"Unsupported protocol '{protocol}'")
+    now = datetime.now(tz=timezone.utc).isoformat()
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        host_row = _ensure_host(conn, host_id)
+        host_protocols = _json_loads(host_row["protocols"]) or []
+        if normalized_protocol not in host_protocols:
+            raise ValidationError("Host is not configured for the specified protocol")
+        gateway_row = _ensure_protocol_gateway(conn, gateway_id)
+        if gateway_row["protocol"] != normalized_protocol:
+            raise ValidationError("Gateway protocol does not match the requested protocol")
+        if normalized_protocol in {"ssh", "sftp", "rdp"} and not bool(gateway_row["tls_enabled"]):
+            raise ValidationError("Gateways for SSH/SFTP/RDP must have TLS enabled")
+        if normalized_protocol == "rdp" and not bool(gateway_row["nla_required"]):
+            raise ValidationError("RDP gateways must require NLA")
+        conn.execute(
+            """
+            INSERT INTO host_gateway_bindings (host_id, protocol, gateway_id, created_at, created_by)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(host_id, protocol) DO UPDATE SET
+                gateway_id = excluded.gateway_id,
+                created_at = excluded.created_at,
+                created_by = excluded.created_by
+            """,
+            (host_id, normalized_protocol, gateway_id, now, actor_id),
+        )
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="host_gateway.assigned",
+            target_type="host",
+            target_id=host_id,
+            metadata={"protocol": normalized_protocol, "gateway_id": gateway_id},
+        )
+        conn.commit()
+        binding = _get_gateway_binding(conn, host_id, normalized_protocol)
+        if binding is None:
+            raise ValidationError("Failed to load assigned gateway")
+        return binding
+
+
+def list_host_gateways(host_id: int) -> List[Dict]:
+    with get_connection() as conn:
+        _ensure_host(conn, host_id)
+        bindings = _map_host_gateways(conn, [host_id]).get(host_id, [])
+        return bindings
+
+
+def remove_host_gateway(
+    *,
+    host_id: int,
+    protocol: str,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    if not isinstance(protocol, str):
+        raise ValidationError("protocol must be a string")
+    normalized_protocol = protocol.strip().lower()
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        _ensure_host(conn, host_id)
+        binding = _get_gateway_binding(conn, host_id, normalized_protocol)
+        if binding is None:
+            raise ValidationError("Host does not have a gateway for the specified protocol")
+        conn.execute(
+            "DELETE FROM host_gateway_bindings WHERE host_id = ? AND protocol = ?",
+            (host_id, normalized_protocol),
+        )
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="host_gateway.removed",
+            target_type="host",
+            target_id=host_id,
+            metadata={"protocol": normalized_protocol, "gateway_id": binding["gateway_id"]},
+        )
+        conn.commit()
+        return binding
 
 
 def create_host_group(
@@ -2563,6 +3115,8 @@ def start_session(
             raise ValidationError("Requested protocol is not enabled for the host")
         if protocol == "rdp" and not bool(host_row["rdp_nla"]):
             raise ValidationError("RDP sessions require NLA to be enabled for the host")
+        binding = _require_gateway_binding(conn, host_id, protocol)
+        gateway = binding["gateway"]
         roles = _json_loads(user_row["roles"]) or []
         command_policy_id: Optional[int] = None
         if ROLE_ADMIN not in roles:
@@ -2598,6 +3152,12 @@ def start_session(
             session_metadata["requested_commands"] = normalized_commands
         if command_policy_id is not None:
             session_metadata["command_policy_id"] = command_policy_id
+        session_metadata["gateway_id"] = gateway["id"]
+        session_metadata["gateway_name"] = gateway["name"]
+        session_metadata["gateway_endpoint"] = {
+            "host": gateway["endpoint_host"],
+            "port": gateway["endpoint_port"],
+        }
         metadata_json = json.dumps(session_metadata) if session_metadata else None
         cursor = conn.execute(
             """
@@ -2612,6 +3172,7 @@ def start_session(
             "protocol": protocol,
             "source_ip": str(client_ip),
         }
+        audit_metadata["gateway_id"] = gateway["id"]
         if normalized_commands:
             audit_metadata["requested_commands"] = normalized_commands
         if command_policy_id is not None:
@@ -2832,7 +3393,14 @@ def create_session_connection(
         if not bool(credential_row["is_active"]):
             raise ValidationError("credential must be active")
         host_row = _ensure_host(conn, session_row["host_id"])
-        instructions = _build_connection_instructions(host_row, credential_row, chosen_protocol)
+        binding = _require_gateway_binding(conn, session_row["host_id"], chosen_protocol)
+        gateway = binding["gateway"]
+        instructions = _build_connection_instructions(
+            host_row,
+            credential_row,
+            chosen_protocol,
+            gateway=gateway,
+        )
         now = datetime.now(tz=timezone.utc).isoformat()
         cursor = conn.execute(
             """

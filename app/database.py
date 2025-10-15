@@ -109,6 +109,29 @@ def init_db() -> None:
         _ensure_host_columns(cursor)
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS protocol_gateways (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                protocol TEXT NOT NULL,
+                endpoint_host TEXT NOT NULL,
+                endpoint_port INTEGER NOT NULL,
+                tls_enabled INTEGER NOT NULL DEFAULT 1,
+                nla_required INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                description TEXT,
+                last_health_status TEXT NOT NULL DEFAULT 'unknown',
+                last_health_message TEXT,
+                last_health_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_protocol_gateways_protocol ON protocol_gateways(protocol)"
+        )
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS host_groups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL,
@@ -126,6 +149,24 @@ def init_db() -> None:
                 FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE
             )
             """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS host_gateway_bindings (
+                host_id INTEGER NOT NULL,
+                protocol TEXT NOT NULL,
+                gateway_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                created_by INTEGER,
+                PRIMARY KEY (host_id, protocol),
+                FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE,
+                FOREIGN KEY(gateway_id) REFERENCES protocol_gateways(id) ON DELETE CASCADE,
+                FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_host_gateway_bindings_gateway ON host_gateway_bindings(gateway_id)"
         )
         cursor.execute(
             """

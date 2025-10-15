@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.14.0")
+app = FastAPI(title="Bastion Management Service", version="0.15.0")
 
 
 def _handle_validation_error(func):
@@ -214,6 +214,160 @@ def update_host(host_id: str, payload: Dict) -> Dict:
         tags=tags,
         environment=payload.get("environment"),
         business_unit=payload.get("business_unit"),
+        performed_by=parsed_actor,
+    )
+
+
+@app.post("/protocol-gateways", status_code=status.HTTP_201_CREATED)
+@_handle_validation_error
+def create_protocol_gateway(payload: Dict) -> Dict:
+    endpoint_port = _parse_int(payload.get("endpoint_port"), "endpoint_port")
+    tls_enabled = _parse_bool(payload.get("tls_enabled", True), "tls_enabled")
+    nla_required = _parse_bool(payload.get("nla_required", False), "nla_required")
+    is_active = _parse_bool(payload.get("is_active", True), "is_active")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    return crud.create_protocol_gateway(
+        name=payload.get("name"),
+        protocol=payload.get("protocol"),
+        endpoint_host=payload.get("endpoint_host"),
+        endpoint_port=endpoint_port,
+        tls_enabled=tls_enabled,
+        nla_required=nla_required,
+        description=payload.get("description"),
+        is_active=is_active,
+        performed_by=parsed_actor,
+    )
+
+
+@app.get("/protocol-gateways")
+@_handle_validation_error
+def list_protocol_gateways(
+    protocol: Optional[str] = None,
+    is_active: Optional[str] = None,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
+) -> List[Dict]:
+    parsed_is_active: Optional[bool] = None
+    parsed_limit: Optional[int] = None
+    parsed_offset: Optional[int] = None
+    if is_active is not None:
+        parsed_is_active = _parse_bool(is_active, "is_active")
+    if limit is not None:
+        parsed_limit = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        parsed_offset = _parse_non_negative_int(offset, "offset")
+    return crud.list_protocol_gateways(
+        protocol=protocol,
+        is_active=parsed_is_active,
+        limit=parsed_limit,
+        offset=parsed_offset,
+    )
+
+
+@app.get("/protocol-gateways/{gateway_id}")
+@_handle_validation_error
+def get_protocol_gateway(gateway_id: str) -> Dict:
+    return crud.get_protocol_gateway(_parse_int(gateway_id, "gateway_id"))
+
+
+@app.patch("/protocol-gateways/{gateway_id}")
+@_handle_validation_error
+def update_protocol_gateway(gateway_id: str, payload: Dict) -> Dict:
+    endpoint_port: Optional[int] = None
+    tls_enabled: Optional[bool] = None
+    nla_required: Optional[bool] = None
+    is_active: Optional[bool] = None
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if "endpoint_port" in payload:
+        endpoint_port = _parse_int(payload.get("endpoint_port"), "endpoint_port")
+    if "tls_enabled" in payload:
+        tls_enabled = _parse_bool(payload.get("tls_enabled"), "tls_enabled")
+    if "nla_required" in payload:
+        nla_required = _parse_bool(payload.get("nla_required"), "nla_required")
+    if "is_active" in payload:
+        is_active = _parse_bool(payload.get("is_active"), "is_active")
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    description = payload.get("description") if "description" in payload else None
+    return crud.update_protocol_gateway(
+        _parse_int(gateway_id, "gateway_id"),
+        endpoint_host=payload.get("endpoint_host") if "endpoint_host" in payload else None,
+        endpoint_port=endpoint_port,
+        tls_enabled=tls_enabled,
+        nla_required=nla_required,
+        description=description,
+        is_active=is_active,
+        performed_by=parsed_actor,
+    )
+
+
+@app.delete("/protocol-gateways/{gateway_id}", status_code=status.HTTP_204_NO_CONTENT)
+@_handle_validation_error
+def delete_protocol_gateway(gateway_id: str, performed_by: Optional[str] = None):
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    crud.delete_protocol_gateway(
+        _parse_int(gateway_id, "gateway_id"),
+        performed_by=parsed_actor,
+    )
+    return None
+
+
+@app.post("/protocol-gateways/{gateway_id}/health-checks")
+@_handle_validation_error
+def report_protocol_gateway_health(gateway_id: str, payload: Dict) -> Dict:
+    status_value = payload.get("status")
+    if status_value is None or not isinstance(status_value, str):
+        raise ValidationError("status must be provided as a string")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    return crud.record_protocol_gateway_health(
+        _parse_int(gateway_id, "gateway_id"),
+        status=status_value,
+        message=payload.get("message"),
+        performed_by=parsed_actor,
+    )
+
+
+@app.put("/hosts/{host_id}/gateways/{protocol}")
+@_handle_validation_error
+def assign_host_gateway(host_id: str, protocol: str, payload: Dict) -> Dict:
+    if "gateway_id" not in payload:
+        raise ValidationError("gateway_id is required")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    return crud.assign_gateway_to_host(
+        host_id=_parse_int(host_id, "host_id"),
+        protocol=protocol,
+        gateway_id=_parse_int(payload.get("gateway_id"), "gateway_id"),
+        performed_by=parsed_actor,
+    )
+
+
+@app.get("/hosts/{host_id}/gateways")
+@_handle_validation_error
+def list_host_gateways(host_id: str) -> List[Dict]:
+    return crud.list_host_gateways(_parse_int(host_id, "host_id"))
+
+
+@app.delete("/hosts/{host_id}/gateways/{protocol}")
+@_handle_validation_error
+def remove_host_gateway(host_id: str, protocol: str, performed_by: Optional[str] = None) -> Dict:
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    return crud.remove_host_gateway(
+        host_id=_parse_int(host_id, "host_id"),
+        protocol=protocol,
         performed_by=parsed_actor,
     )
 
