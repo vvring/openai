@@ -25,6 +25,11 @@ SUPPORTED_ENVIRONMENTS = {
     "development",
 }
 
+SUPPORTED_CREDENTIAL_SECRET_TYPES = {
+    "password",
+    "ssh_key",
+}
+
 ACCESS_REQUEST_STATUS_PENDING = "pending"
 ACCESS_REQUEST_STATUS_APPROVED = "approved"
 ACCESS_REQUEST_STATUS_DENIED = "denied"

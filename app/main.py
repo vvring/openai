@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.10.0")
+app = FastAPI(title="Bastion Management Service", version="0.11.0")
 
 
 def _handle_validation_error(func):
@@ -334,6 +334,100 @@ def remove_host_group_member(
     return crud.remove_host_from_group(
         group_id=_parse_int(group_id, "group_id"),
         host_id=_parse_int(host_id, "host_id"),
+        performed_by=parsed_actor,
+    )
+
+
+@app.post("/credentials", status_code=status.HTTP_201_CREATED)
+@_handle_validation_error
+def create_credential(payload: Dict) -> Dict:
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    rotation_frequency = payload.get("rotation_frequency_days")
+    parsed_rotation: Optional[int] = None
+    if rotation_frequency is not None:
+        parsed_rotation = _parse_positive_int(rotation_frequency, "rotation_frequency_days")
+    host_id = _parse_int(payload.get("host_id"), "host_id")
+    return crud.create_credential(
+        host_id=host_id,
+        name=payload.get("name"),
+        username=payload.get("username"),
+        secret=payload.get("secret"),
+        secret_type=payload.get("secret_type"),
+        rotation_frequency_days=parsed_rotation,
+        last_rotated_at=payload.get("last_rotated_at"),
+        description=payload.get("description"),
+        performed_by=parsed_actor,
+    )
+
+
+@app.get("/credentials")
+@_handle_validation_error
+def list_credentials(
+    host_id: Optional[str] = None,
+    is_active: Optional[str] = None,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
+) -> List[Dict]:
+    parsed_host_id: Optional[int] = None
+    parsed_is_active: Optional[bool] = None
+    if host_id is not None:
+        parsed_host_id = _parse_int(host_id, "host_id")
+    if is_active is not None:
+        parsed_is_active = _parse_bool(is_active, "is_active")
+    parsed_limit: Optional[int] = None
+    parsed_offset: Optional[int] = None
+    if limit is not None:
+        parsed_limit = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        parsed_offset = _parse_non_negative_int(offset, "offset")
+    return crud.list_credentials(
+        host_id=parsed_host_id,
+        is_active=parsed_is_active,
+        limit=parsed_limit,
+        offset=parsed_offset,
+    )
+
+
+@app.get("/credentials/{credential_id}")
+@_handle_validation_error
+def get_credential(credential_id: str) -> Dict:
+    return crud.get_credential(_parse_int(credential_id, "credential_id"))
+
+
+@app.patch("/credentials/{credential_id}")
+@_handle_validation_error
+def update_credential(credential_id: str, payload: Dict) -> Dict:
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    rotation_frequency_present = "rotation_frequency_days" in payload
+    rotation_frequency = payload.get("rotation_frequency_days")
+    parsed_rotation: Optional[int] = None
+    if rotation_frequency_present and rotation_frequency is not None:
+        parsed_rotation = _parse_positive_int(rotation_frequency, "rotation_frequency_days")
+    is_active_value = payload.get("is_active") if "is_active" in payload else None
+    parsed_is_active: Optional[bool] = None
+    if "is_active" in payload:
+        parsed_is_active = _parse_bool(is_active_value, "is_active")
+    description = payload.get("description") if "description" in payload else None
+    if "description" in payload and description is None:
+        description = ""
+    secret_value = payload.get("secret") if "secret" in payload else None
+    return crud.update_credential(
+        _parse_int(credential_id, "credential_id"),
+        name=payload.get("name"),
+        username=payload.get("username"),
+        secret=secret_value,
+        secret_type=payload.get("secret_type"),
+        rotation_frequency_days=parsed_rotation,
+        update_rotation_frequency=rotation_frequency_present,
+        last_rotated_at=payload.get("last_rotated_at"),
+        description=description,
+        is_active=parsed_is_active,
         performed_by=parsed_actor,
     )
 

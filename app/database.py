@@ -120,6 +120,34 @@ def init_db() -> None:
         )
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS credentials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                username TEXT NOT NULL,
+                secret TEXT NOT NULL,
+                secret_type TEXT NOT NULL,
+                rotation_frequency_days INTEGER,
+                last_rotated_at TEXT,
+                description TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                created_by INTEGER,
+                UNIQUE(host_id, name),
+                FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE,
+                FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_credentials_host ON credentials(host_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_credentials_active ON credentials(is_active)"
+        )
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS authorizations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,

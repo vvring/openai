@@ -18,6 +18,7 @@ from .models import (
     ROLE_ADMIN,
     ROLE_AUDITOR,
     ROLE_OPERATOR,
+    SUPPORTED_CREDENTIAL_SECRET_TYPES,
     SUPPORTED_ENVIRONMENTS,
     SUPPORTED_PRIVILEGES,
     SUPPORTED_PROTOCOLS,
@@ -152,6 +153,28 @@ def _row_to_audit_event(row) -> Dict:
         "target_id": row["target_id"],
         "metadata": metadata,
         "created_at": row["created_at"],
+    }
+
+
+def _row_to_credential(row) -> Dict:
+    secret = row["secret"] or ""
+    preview = None
+    if secret:
+        preview = secret[-4:] if len(secret) > 4 else secret
+    return {
+        "id": row["id"],
+        "host_id": row["host_id"],
+        "name": row["name"],
+        "username": row["username"],
+        "secret_type": row["secret_type"],
+        "secret_preview": preview,
+        "rotation_frequency_days": row["rotation_frequency_days"],
+        "last_rotated_at": row["last_rotated_at"],
+        "description": row["description"],
+        "is_active": bool(row["is_active"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "created_by": row["created_by"],
     }
 
 
@@ -332,6 +355,15 @@ def _normalize_tags(tags: Optional[List[str]]) -> List[str]:
     return deduped
 
 
+def _require_non_empty_string(value: Optional[str], field: str, *, max_length: Optional[int] = None) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{field} must be a non-empty string")
+    cleaned = value.strip()
+    if max_length is not None and len(cleaned) > max_length:
+        raise ValidationError(f"{field} cannot exceed {max_length} characters")
+    return cleaned
+
+
 def _ensure_actor(conn: sqlite3.Connection, actor_id: Optional[int]) -> Optional[int]:
     if actor_id is None:
         return None
@@ -375,6 +407,13 @@ def _ensure_authorization(conn: sqlite3.Connection, authorization_id: int):
     return row
 
 
+def _ensure_host(conn: sqlite3.Connection, host_id: int):
+    row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
+    if not row:
+        raise ValidationError(f"Host {host_id} not found")
+    return row
+
+
 def _parse_time_of_day(value: str, field: str) -> time:
     if not isinstance(value, str):
         raise ValidationError(f"{field} must be a HH:MM string")
@@ -395,6 +434,18 @@ def _parse_datetime(value: str, field: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _validate_rotation_frequency(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    if not isinstance(value, int):
+        raise ValidationError("rotation_frequency_days must be an integer")
+    if value <= 0:
+        raise ValidationError("rotation_frequency_days must be greater than zero")
+    if value > 3650:
+        raise ValidationError("rotation_frequency_days cannot exceed 3650 days")
+    return value
 
 
 def _normalize_days_of_week(days: List[str]) -> List[str]:
@@ -1306,6 +1357,252 @@ def remove_host_from_group(
         payload = _row_to_host_group(group_row, host_ids=host_ids)
         payload["hosts"] = _fetch_hosts_for_group(conn, group_id)
         return payload
+
+
+def create_credential(
+    *,
+    host_id: int,
+    name: str,
+    username: str,
+    secret: str,
+    secret_type: str,
+    rotation_frequency_days: Optional[int] = None,
+    last_rotated_at: Optional[str] = None,
+    description: Optional[str] = None,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    if not isinstance(host_id, int):
+        raise ValidationError("host_id must be an integer")
+    normalized_name = _require_non_empty_string(name, "name", max_length=120)
+    normalized_username = _require_non_empty_string(username, "username", max_length=120)
+    if not isinstance(secret, str) or not secret:
+        raise ValidationError("secret must be a non-empty string")
+    if len(secret) > 4096:
+        raise ValidationError("secret cannot exceed 4096 characters")
+    if secret_type not in SUPPORTED_CREDENTIAL_SECRET_TYPES:
+        raise ValidationError("Unsupported credential secret_type")
+    rotation_frequency = _validate_rotation_frequency(rotation_frequency_days)
+    normalized_description: Optional[str] = None
+    if description is not None:
+        if description != "" and not isinstance(description, str):
+            raise ValidationError("description must be a string if provided")
+        normalized_description = description.strip() if isinstance(description, str) else None
+        if normalized_description == "":
+            normalized_description = None
+    created_at = datetime.now(tz=timezone.utc).isoformat()
+    last_rotated_iso: str
+    if last_rotated_at is not None:
+        last_rotated_iso = _parse_datetime(last_rotated_at, "last_rotated_at").isoformat()
+    else:
+        last_rotated_iso = created_at
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        _ensure_host(conn, host_id)
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO credentials (
+                    host_id,
+                    name,
+                    username,
+                    secret,
+                    secret_type,
+                    rotation_frequency_days,
+                    last_rotated_at,
+                    description,
+                    is_active,
+                    created_at,
+                    updated_at,
+                    created_by
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    host_id,
+                    normalized_name,
+                    normalized_username,
+                    secret,
+                    secret_type,
+                    rotation_frequency,
+                    last_rotated_iso,
+                    normalized_description,
+                    created_at,
+                    created_at,
+                    actor_id,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("Credential name already exists for host") from exc
+        credential_id = cursor.lastrowid
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="credential.created",
+            target_type="credential",
+            target_id=credential_id,
+            metadata={
+                "host_id": host_id,
+                "name": normalized_name,
+                "username": normalized_username,
+                "secret_type": secret_type,
+                "rotation_frequency_days": rotation_frequency,
+                "last_rotated_at": last_rotated_iso,
+            },
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM credentials WHERE id = ?", (credential_id,)).fetchone()
+        return _row_to_credential(row)
+
+
+def list_credentials(
+    *,
+    host_id: Optional[int] = None,
+    is_active: Optional[bool] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> List[Dict]:
+    _validate_pagination(limit, offset)
+    clauses: List[str] = []
+    params: List[Any] = []
+    if host_id is not None:
+        if not isinstance(host_id, int):
+            raise ValidationError("host_id must be an integer")
+        clauses.append("host_id = ?")
+        params.append(host_id)
+    if is_active is not None:
+        if not isinstance(is_active, bool):
+            raise ValidationError("is_active must be a boolean")
+        clauses.append("is_active = ?")
+        params.append(int(is_active))
+    query = "SELECT * FROM credentials"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY id ASC"
+    query, params = _apply_pagination(query, params, limit, offset)
+    with get_connection() as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+        return [_row_to_credential(row) for row in rows]
+
+
+def get_credential(credential_id: int) -> Dict:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM credentials WHERE id = ?", (credential_id,)).fetchone()
+        if not row:
+            raise ValidationError(f"Credential {credential_id} not found")
+        return _row_to_credential(row)
+
+
+def update_credential(
+    credential_id: int,
+    *,
+    name: Optional[str] = None,
+    username: Optional[str] = None,
+    secret: Optional[str] = None,
+    secret_type: Optional[str] = None,
+    rotation_frequency_days: Optional[int] = None,
+    update_rotation_frequency: bool = False,
+    last_rotated_at: Optional[str] = None,
+    description: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    updates: List[str] = []
+    params: List[Any] = []
+    changes: Dict[str, Any] = {}
+    normalized_name: Optional[str] = None
+    normalized_username: Optional[str] = None
+    normalized_description: Optional[str] = None
+    if name is not None:
+        normalized_name = _require_non_empty_string(name, "name", max_length=120)
+    if username is not None:
+        normalized_username = _require_non_empty_string(username, "username", max_length=120)
+    if secret is not None:
+        if not isinstance(secret, str) or not secret:
+            raise ValidationError("secret must be a non-empty string")
+        if len(secret) > 4096:
+            raise ValidationError("secret cannot exceed 4096 characters")
+    if secret_type is not None and secret_type not in SUPPORTED_CREDENTIAL_SECRET_TYPES:
+        raise ValidationError("Unsupported credential secret_type")
+    if description is not None:
+        if description != "" and not isinstance(description, str):
+            raise ValidationError("description must be a string if provided")
+        normalized_description = description.strip() if isinstance(description, str) else None
+        if normalized_description == "":
+            normalized_description = None
+    rotation_frequency: Optional[int] = None
+    if update_rotation_frequency:
+        rotation_frequency = _validate_rotation_frequency(rotation_frequency_days)
+    last_rotated_iso: Optional[str] = None
+    if last_rotated_at is not None:
+        last_rotated_iso = _parse_datetime(last_rotated_at, "last_rotated_at").isoformat()
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        row = conn.execute("SELECT * FROM credentials WHERE id = ?", (credential_id,)).fetchone()
+        if not row:
+            raise ValidationError(f"Credential {credential_id} not found")
+        if normalized_name is not None:
+            updates.append("name = ?")
+            params.append(normalized_name)
+            changes["name"] = normalized_name
+        if normalized_username is not None:
+            updates.append("username = ?")
+            params.append(normalized_username)
+            changes["username"] = normalized_username
+        if secret_type is not None:
+            updates.append("secret_type = ?")
+            params.append(secret_type)
+            changes["secret_type"] = secret_type
+        secret_rotated = False
+        if secret is not None:
+            updates.append("secret = ?")
+            params.append(secret)
+            secret_rotated = True
+        if update_rotation_frequency:
+            updates.append("rotation_frequency_days = ?")
+            params.append(rotation_frequency)
+            changes["rotation_frequency_days"] = rotation_frequency
+        if normalized_description is not None or description == "":
+            updates.append("description = ?")
+            params.append(normalized_description)
+            changes["description"] = normalized_description
+        if is_active is not None:
+            if not isinstance(is_active, bool):
+                raise ValidationError("is_active must be a boolean")
+            updates.append("is_active = ?")
+            params.append(int(is_active))
+            changes["is_active"] = bool(is_active)
+        if secret_rotated and last_rotated_iso is None:
+            last_rotated_iso = datetime.now(tz=timezone.utc).isoformat()
+        if last_rotated_iso is not None:
+            updates.append("last_rotated_at = ?")
+            params.append(last_rotated_iso)
+            changes["last_rotated_at"] = last_rotated_iso
+        if not updates:
+            raise ValidationError("No fields provided for update")
+        updates.append("updated_at = ?")
+        updated_at = datetime.now(tz=timezone.utc).isoformat()
+        params.append(updated_at)
+        try:
+            conn.execute(
+                f"UPDATE credentials SET {', '.join(updates)} WHERE id = ?",
+                (*params, credential_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("Credential name already exists for host") from exc
+        audit_metadata = dict(changes)
+        if secret_rotated:
+            audit_metadata["secret_rotated"] = True
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="credential.updated",
+            target_type="credential",
+            target_id=credential_id,
+            metadata=audit_metadata,
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM credentials WHERE id = ?", (credential_id,)).fetchone()
+        return _row_to_credential(row)
 
 
 def authorize_user(

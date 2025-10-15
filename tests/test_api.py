@@ -25,6 +25,7 @@ def fresh_database():
             "recordings",
             "sessions",
             "access_requests",
+            "credentials",
             "authorizations",
             "host_group_members",
             "host_groups",
@@ -41,6 +42,7 @@ def fresh_database():
             "recordings",
             "sessions",
             "access_requests",
+            "credentials",
             "authorizations",
             "host_group_members",
             "host_groups",
@@ -251,6 +253,151 @@ def test_host_group_lifecycle():
     final_list = client.get("/host-groups")
     assert final_list.status_code == 200
     assert final_list.json() == []
+
+
+def test_credential_lifecycle():
+    admin_resp = client.post(
+        "/users",
+        json={
+            "username": "cred-admin",
+            "full_name": "Credential Admin",
+            "email": "cred-admin@example.com",
+            "roles": ["admin"],
+        },
+    )
+    assert admin_resp.status_code == 201, admin_resp.text
+    admin_id = admin_resp.json()["id"]
+
+    host_resp = client.post(
+        "/hosts",
+        json={
+            "name": "vault-host",
+            "hostname": "10.2.0.5",
+            "port": 22,
+            "operating_system": "linux",
+            "protocols": ["ssh", "sftp"],
+            "tls_enabled": True,
+            "rdp_nla": False,
+            "performed_by": admin_id,
+        },
+    )
+    assert host_resp.status_code == 201, host_resp.text
+    host_id = host_resp.json()["id"]
+
+    create_resp = client.post(
+        "/credentials",
+        json={
+            "host_id": host_id,
+            "name": "root-admin",
+            "username": "root",
+            "secret": "super-secret-value",
+            "secret_type": "password",
+            "rotation_frequency_days": 90,
+            "performed_by": admin_id,
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    credential = create_resp.json()
+    assert credential["host_id"] == host_id
+    assert credential["secret_preview"] == "alue"
+    assert credential["created_by"] == admin_id
+    assert credential["rotation_frequency_days"] == 90
+
+    list_resp = client.get("/credentials")
+    assert list_resp.status_code == 200
+    assert any(item["id"] == credential["id"] for item in list_resp.json())
+
+    filter_resp = client.get(f"/credentials?host_id={host_id}&is_active=true")
+    assert filter_resp.status_code == 200
+    filtered = filter_resp.json()
+    assert len(filtered) == 1
+    assert filtered[0]["name"] == "root-admin"
+
+    detail_resp = client.get(f"/credentials/{credential['id']}")
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert detail["secret_preview"] == "alue"
+
+    update_resp = client.patch(
+        f"/credentials/{credential['id']}",
+        json={
+            "description": "Rotated secret",
+            "secret": "rotated-secret-material",
+            "rotation_frequency_days": 45,
+            "is_active": False,
+            "performed_by": admin_id,
+        },
+    )
+    assert update_resp.status_code == 200, update_resp.text
+    updated = update_resp.json()
+    assert updated["secret_preview"] == "rial"
+    assert updated["is_active"] is False
+    assert updated["rotation_frequency_days"] == 45
+
+    clear_rotation_resp = client.patch(
+        f"/credentials/{credential['id']}",
+        json={
+            "rotation_frequency_days": None,
+            "performed_by": admin_id,
+        },
+    )
+    assert clear_rotation_resp.status_code == 200, clear_rotation_resp.text
+    cleared = clear_rotation_resp.json()
+    assert cleared["rotation_frequency_days"] is None
+
+    inactive_resp = client.get("/credentials?is_active=true")
+    assert inactive_resp.status_code == 200
+    assert all(item["is_active"] for item in inactive_resp.json())
+
+    disabled_resp = client.get("/credentials?is_active=false")
+    assert disabled_resp.status_code == 200
+    disabled = disabled_resp.json()
+    assert len(disabled) == 1
+    assert disabled[0]["id"] == credential["id"]
+
+
+def test_credential_secret_type_validation():
+    admin_resp = client.post(
+        "/users",
+        json={
+            "username": "cred-validator",
+            "full_name": "Credential Validator",
+            "email": "cred-validator@example.com",
+            "roles": ["admin"],
+        },
+    )
+    assert admin_resp.status_code == 201, admin_resp.text
+    admin_id = admin_resp.json()["id"]
+
+    host_resp = client.post(
+        "/hosts",
+        json={
+            "name": "invalid-host",
+            "hostname": "10.2.0.6",
+            "port": 22,
+            "operating_system": "linux",
+            "protocols": ["ssh"],
+            "tls_enabled": True,
+            "rdp_nla": False,
+            "performed_by": admin_id,
+        },
+    )
+    assert host_resp.status_code == 201, host_resp.text
+    host_id = host_resp.json()["id"]
+
+    bad_resp = client.post(
+        "/credentials",
+        json={
+            "host_id": host_id,
+            "name": "bad",
+            "username": "root",
+            "secret": "secret",
+            "secret_type": "token",
+            "performed_by": admin_id,
+        },
+    )
+    assert bad_resp.status_code == 400
+    assert "Unsupported credential" in bad_resp.text
 
 
 def test_authorization_enforcement_and_listing():

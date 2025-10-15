@@ -32,6 +32,23 @@ class Host:
 
 
 @dataclass(slots=True)
+class Credential:
+    id: int
+    host_id: int
+    name: str
+    username: str
+    secret_type: str
+    secret_preview: Optional[str] = None
+    rotation_frequency_days: Optional[int] = None
+    last_rotated_at: datetime = field(default_factory=datetime.utcnow)
+    description: Optional[str] = None
+    is_active: bool = True
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_by: Optional[int] = None
+
+
+@dataclass(slots=True)
 class HostGroup:
     id: int
     name: str
