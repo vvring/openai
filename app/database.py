@@ -39,6 +39,11 @@ def _ensure_authorization_columns(cursor: sqlite3.Cursor) -> None:
         cursor.execute(
             "ALTER TABLE authorizations ADD COLUMN requires_approval INTEGER NOT NULL DEFAULT 0"
         )
+    if "source_cidrs" not in existing:
+        cursor.execute(
+            "ALTER TABLE authorizations ADD COLUMN source_cidrs TEXT NOT NULL DEFAULT '[]'"
+        )
+        cursor.execute("UPDATE authorizations SET source_cidrs = '[]' WHERE source_cidrs IS NULL")
 
 
 def _ensure_access_request_columns(cursor: sqlite3.Cursor) -> None:
@@ -155,6 +160,7 @@ def init_db() -> None:
                 privileges TEXT NOT NULL,
                 access_window_id INTEGER,
                 requires_approval INTEGER NOT NULL DEFAULT 0,
+                source_cidrs TEXT NOT NULL DEFAULT '[]',
                 UNIQUE(user_id, host_id),
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE

@@ -86,7 +86,12 @@ def test_user_host_flow():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": user_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": user_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "203.0.113.10",
+        },
     )
     assert resp.status_code == 201, resp.text
     session_id = resp.json()["id"]
@@ -143,6 +148,7 @@ def test_host_group_lifecycle():
             "full_name": "Group Admin",
             "email": "group-admin@example.com",
             "roles": ["admin"],
+            "source_ip": "198.51.100.10",
         },
     )
     assert admin_resp.status_code == 201, admin_resp.text
@@ -426,7 +432,12 @@ def test_authorization_enforcement_and_listing():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": user_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": user_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 400
     assert "access" in resp.json()["detail"]
@@ -450,7 +461,12 @@ def test_authorization_enforcement_and_listing():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": user_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": user_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 201, resp.text
 
@@ -464,7 +480,12 @@ def test_authorization_enforcement_and_listing():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": user_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": user_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 400
 
@@ -473,6 +494,88 @@ def test_authorization_enforcement_and_listing():
         json={"user_id": user_id, "host_id": host_id, "privileges": "invalid"},
     )
     assert resp.status_code == 400
+
+
+def test_authorization_source_cidr_enforcement():
+    operator_resp = client.post(
+        "/users",
+        json={
+            "username": "cidr-operator",
+            "full_name": "CIDR Operator",
+            "email": "cidr-operator@example.com",
+            "roles": ["operator"],
+        },
+    )
+    assert operator_resp.status_code == 201
+    operator_id = operator_resp.json()["id"]
+
+    host_resp = client.post(
+        "/hosts",
+        json={
+            "name": "cidr-host",
+            "hostname": "10.0.0.55",
+            "port": 22,
+            "operating_system": "linux",
+            "protocols": ["ssh"],
+            "tls_enabled": True,
+            "rdp_nla": True,
+        },
+    )
+    assert host_resp.status_code == 201
+    host_id = host_resp.json()["id"]
+
+    invalid_resp = client.post(
+        "/authorizations",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "privileges": "read",
+            "source_cidrs": ["not-a-cidr"],
+        },
+    )
+    assert invalid_resp.status_code == 400
+    assert "CIDR" in invalid_resp.json()["detail"]
+
+    resp = client.post(
+        "/authorizations",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "privileges": "read",
+            "source_cidrs": ["203.0.113.0/24", "2001:db8::/64"],
+        },
+    )
+    assert resp.status_code == 204
+
+    missing_ip_resp = client.post(
+        "/sessions",
+        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+    )
+    assert missing_ip_resp.status_code == 400
+    assert "source_ip" in missing_ip_resp.json()["detail"]
+
+    allowed_resp = client.post(
+        "/sessions",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "203.0.113.42",
+        },
+    )
+    assert allowed_resp.status_code == 201, allowed_resp.text
+
+    denied_resp = client.post(
+        "/sessions",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.99",
+        },
+    )
+    assert denied_resp.status_code == 400
+    assert "source_ip" in denied_resp.json()["detail"]
 
 
 def test_protocol_and_nla_enforcement():
@@ -504,7 +607,12 @@ def test_protocol_and_nla_enforcement():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": user_id, "host_id": host_id, "protocol": "rdp"},
+        json={
+            "user_id": user_id,
+            "host_id": host_id,
+            "protocol": "rdp",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 400
     assert "protocol" in resp.json()["detail"]
@@ -530,7 +638,12 @@ def test_protocol_and_nla_enforcement():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": user_id, "host_id": rdp_host_id, "protocol": "rdp"},
+        json={
+            "user_id": user_id,
+            "host_id": rdp_host_id,
+            "protocol": "rdp",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 400
     assert "NLA" in resp.json()["detail"]
@@ -556,7 +669,12 @@ def test_protocol_and_nla_enforcement():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": user_id, "host_id": secure_rdp_host_id, "protocol": "rdp"},
+        json={
+            "user_id": user_id,
+            "host_id": secure_rdp_host_id,
+            "protocol": "rdp",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 201, resp.text
 
@@ -571,7 +689,12 @@ def test_protocol_and_nla_enforcement():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": admin_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": admin_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 201, resp.text
 
@@ -662,7 +785,12 @@ def test_access_window_crud_and_enforcement():
 
     session_resp = client.post(
         "/sessions",
-        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert session_resp.status_code == 201, session_resp.text
 
@@ -678,7 +806,12 @@ def test_access_window_crud_and_enforcement():
 
     denied_resp = client.post(
         "/sessions",
-        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert denied_resp.status_code == 400
     assert "weekday" in denied_resp.json()["detail"].lower() or "time" in denied_resp.json()["detail"].lower()
@@ -770,7 +903,12 @@ def test_audit_event_catalog():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 201
     session_id = resp.json()["id"]
@@ -862,7 +1000,12 @@ def test_user_activation_and_host_updates():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": user_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": user_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 400
     assert "inactive" in resp.json()["detail"]
@@ -872,7 +1015,12 @@ def test_user_activation_and_host_updates():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": user_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": user_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 201
 
@@ -1023,14 +1171,24 @@ def test_session_filters_and_recording_search():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": admin["id"], "host_id": host_a["id"], "protocol": "ssh"},
+        json={
+            "user_id": admin["id"],
+            "host_id": host_a["id"],
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 201
     admin_session = resp.json()
 
     resp = client.post(
         "/sessions",
-        json={"user_id": operator["id"], "host_id": host_a["id"], "protocol": "ssh"},
+        json={
+            "user_id": operator["id"],
+            "host_id": host_a["id"],
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 201
     operator_session_active = resp.json()
@@ -1040,7 +1198,12 @@ def test_session_filters_and_recording_search():
 
     resp = client.post(
         "/sessions",
-        json={"user_id": operator["id"], "host_id": host_b["id"], "protocol": "rdp"},
+        json={
+            "user_id": operator["id"],
+            "host_id": host_b["id"],
+            "protocol": "rdp",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert resp.status_code == 201
     operator_session_rdp = resp.json()
@@ -1242,7 +1405,12 @@ def test_access_request_approval_flow():
 
     start_resp = client.post(
         "/sessions",
-        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert start_resp.status_code == 400
     assert "requires an approved request" in start_resp.json()["detail"].lower()
@@ -1279,7 +1447,12 @@ def test_access_request_approval_flow():
 
     session_resp = client.post(
         "/sessions",
-        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert session_resp.status_code == 201, session_resp.text
 
@@ -1296,7 +1469,12 @@ def test_access_request_approval_flow():
 
     blocked_resp = client.post(
         "/sessions",
-        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert blocked_resp.status_code == 400
 
@@ -1325,7 +1503,12 @@ def test_access_request_approval_flow():
 
     final_resp = client.post(
         "/sessions",
-        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.10",
+        },
     )
     assert final_resp.status_code == 400
 

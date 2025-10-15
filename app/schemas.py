@@ -64,6 +64,7 @@ class Authorization:
     privileges: str
     access_window_id: Optional[int] = None
     requires_approval: bool = False
+    source_cidrs: List[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

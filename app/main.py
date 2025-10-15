@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.11.0")
+app = FastAPI(title="Bastion Management Service", version="0.12.0")
 
 
 def _handle_validation_error(func):
@@ -523,12 +523,16 @@ def assign_authorization(payload: Dict):
     parsed_requires = False
     if requires_approval is not None:
         parsed_requires = _parse_bool(requires_approval, "requires_approval")
+    source_cidrs = payload.get("source_cidrs")
+    if source_cidrs is not None and not isinstance(source_cidrs, list):
+        raise ValidationError("source_cidrs must be provided as a list")
     crud.authorize_user(
         user_id,
         host_id,
         payload.get("privileges", "read"),
         access_window_id=parsed_window,
         requires_approval=parsed_requires,
+        source_cidrs=source_cidrs,
         performed_by=parsed_actor,
     )
     return None
@@ -674,6 +678,7 @@ def start_session(payload: Dict) -> Dict:
         user_id=_parse_int(payload.get("user_id"), "user_id"),
         host_id=_parse_int(payload.get("host_id"), "host_id"),
         protocol=payload.get("protocol"),
+        source_ip=payload.get("source_ip"),
     )
 
 

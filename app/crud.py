@@ -1,6 +1,7 @@
 """CRUD helpers implemented on top of sqlite3."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import sqlite3
 from datetime import datetime, time, timezone
@@ -94,6 +95,9 @@ def _row_to_authorization(row) -> Dict:
         "requires_approval": bool(row["requires_approval"])
         if "requires_approval" in row.keys()
         else False,
+        "source_cidrs": _json_loads(row["source_cidrs"]) or []
+        if "source_cidrs" in row.keys()
+        else [],
     }
 
 
@@ -189,6 +193,33 @@ def _row_to_access_window(row) -> Dict:
         "timezone": row["timezone"],
         "description": row["description"],
     }
+
+
+def _normalize_source_cidrs(value) -> List[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValidationError("source_cidrs must be provided as a list of CIDR strings")
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise ValidationError("source_cidrs entries must be strings")
+        candidate = item.strip()
+        if not candidate:
+            raise ValidationError("source_cidrs entries cannot be empty")
+        try:
+            network = ipaddress.ip_network(candidate, strict=False)
+        except ValueError as exc:
+            raise ValidationError(f"Invalid CIDR '{candidate}' in source_cidrs") from exc
+        canonical = str(network)
+        if canonical in seen:
+            continue
+        normalized.append(canonical)
+        seen.add(canonical)
+    if len(normalized) > 50:
+        raise ValidationError("source_cidrs cannot include more than 50 entries")
+    return normalized
 
 
 _VALID_WEEKDAYS = [
@@ -1612,11 +1643,14 @@ def authorize_user(
     *,
     access_window_id: Optional[int] = None,
     requires_approval: bool = False,
+    source_cidrs: Optional[List[str]] = None,
     performed_by: Optional[int] = None,
 ) -> None:
     if not privileges:
         raise ValidationError("privileges must be provided")
     _validate_privileges(privileges)
+    normalized_cidrs = _normalize_source_cidrs(source_cidrs)
+    cidr_payload = json.dumps(normalized_cidrs)
     with get_connection() as conn:
         actor_id = _ensure_actor(conn, performed_by)
         user = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -1643,15 +1677,24 @@ def authorize_user(
                 host_id,
                 privileges,
                 access_window_id,
-                requires_approval
+                requires_approval,
+                source_cidrs
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, host_id) DO UPDATE SET
                 privileges = excluded.privileges,
                 access_window_id = excluded.access_window_id,
-                requires_approval = excluded.requires_approval
+                requires_approval = excluded.requires_approval,
+                source_cidrs = excluded.source_cidrs
             """,
-            (user_id, host_id, privileges, window_id, int(bool(requires_approval))),
+            (
+                user_id,
+                host_id,
+                privileges,
+                window_id,
+                int(bool(requires_approval)),
+                cidr_payload,
+            ),
         )
         row = conn.execute(
             "SELECT * FROM authorizations WHERE user_id = ? AND host_id = ?",
@@ -1668,6 +1711,7 @@ def authorize_user(
                 "privileges": privileges,
                 "access_window_id": row["access_window_id"],
                 "requires_approval": bool(row["requires_approval"]),
+                "source_cidrs": normalized_cidrs,
             },
         )
         conn.commit()
@@ -1730,6 +1774,7 @@ def revoke_authorization(authorization_id: int, *, performed_by: Optional[int] =
                 "user_id": row["user_id"],
                 "host_id": row["host_id"],
                 "access_window_id": row["access_window_id"],
+                "source_cidrs": _json_loads(row["source_cidrs"]) or [],
             },
         )
         conn.commit()
@@ -2049,9 +2094,15 @@ def revoke_access_request(
         return _row_to_access_request(row)
 
 
-def start_session(*, user_id: int, host_id: int, protocol: str) -> Dict:
+def start_session(*, user_id: int, host_id: int, protocol: str, source_ip: str) -> Dict:
     if protocol not in SUPPORTED_PROTOCOLS:
         raise ValidationError(f"Unsupported protocol '{protocol}'")
+    if not source_ip:
+        raise ValidationError("source_ip is required")
+    try:
+        client_ip = ipaddress.ip_address(str(source_ip).strip())
+    except ValueError as exc:
+        raise ValidationError("source_ip must be a valid IPv4 or IPv6 address") from exc
     with get_connection() as conn:
         user_row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         host_row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
@@ -2075,6 +2126,21 @@ def start_session(*, user_id: int, host_id: int, protocol: str) -> Dict:
             _enforce_access_window(conn, auth)
             if bool(auth["requires_approval"]):
                 _enforce_access_request(conn, auth["id"], user_id)
+            allowed_cidrs = _json_loads(auth["source_cidrs"]) or []
+            if allowed_cidrs:
+                allowed = False
+                for cidr in allowed_cidrs:
+                    try:
+                        network = ipaddress.ip_network(cidr, strict=False)
+                    except ValueError:
+                        continue
+                    if client_ip in network:
+                        allowed = True
+                        break
+                if not allowed:
+                    raise ValidationError(
+                        "source_ip is not permitted by the authorization's source_cidrs"
+                    )
         started_at = datetime.now(tz=timezone.utc).isoformat()
         cursor = conn.execute(
             """
@@ -2090,7 +2156,11 @@ def start_session(*, user_id: int, host_id: int, protocol: str) -> Dict:
             action="session.started",
             target_type="session",
             target_id=session_id,
-            metadata={"host_id": host_id, "protocol": protocol},
+            metadata={
+                "host_id": host_id,
+                "protocol": protocol,
+                "source_ip": str(client_ip),
+            },
         )
         conn.commit()
         row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
