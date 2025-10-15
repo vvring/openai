@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.4.0")
+app = FastAPI(title="Bastion Management Service", version="0.5.0")
 
 
 def _handle_validation_error(func):
@@ -94,6 +94,9 @@ def update_user(user_id: str, payload: Dict) -> Dict:
 @app.post("/hosts", status_code=status.HTTP_201_CREATED)
 @_handle_validation_error
 def create_host(payload: Dict) -> Dict:
+    tags = payload.get("tags")
+    if tags is not None and not isinstance(tags, list):
+        raise ValidationError("tags must be provided as a list")
     return crud.create_host(
         name=payload.get("name"),
         hostname=payload.get("hostname"),
@@ -102,12 +105,26 @@ def create_host(payload: Dict) -> Dict:
         protocols=payload.get("protocols", []),
         tls_enabled=bool(payload.get("tls_enabled", True)),
         rdp_nla=bool(payload.get("rdp_nla", True)),
+        tags=tags,
+        environment=payload.get("environment"),
+        business_unit=payload.get("business_unit"),
     )
 
 
 @app.get("/hosts")
-def get_hosts() -> List[Dict]:
-    return crud.list_hosts()
+@_handle_validation_error
+def get_hosts(
+    protocol: Optional[str] = None,
+    environment: Optional[str] = None,
+    tag: Optional[str] = None,
+    search: Optional[str] = None,
+) -> List[Dict]:
+    return crud.list_hosts(
+        protocol=protocol,
+        environment=environment,
+        tag=tag,
+        search=search,
+    )
 
 
 @app.get("/hosts/{host_id}")
@@ -132,6 +149,9 @@ def update_host(host_id: str, payload: Dict) -> Dict:
     parsed_port: Optional[int] = None
     if port is not None:
         parsed_port = _parse_int(port, "port")
+    tags = payload.get("tags")
+    if tags is not None and not isinstance(tags, list):
+        raise ValidationError("tags must be provided as a list")
     return crud.update_host(
         _parse_int(host_id, "host_id"),
         name=payload.get("name"),
@@ -141,6 +161,9 @@ def update_host(host_id: str, payload: Dict) -> Dict:
         protocols=protocols,
         tls_enabled=tls_enabled,
         rdp_nla=rdp_nla,
+        tags=tags,
+        environment=payload.get("environment"),
+        business_unit=payload.get("business_unit"),
     )
 
 

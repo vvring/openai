@@ -18,6 +18,18 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_host_columns(cursor: sqlite3.Cursor) -> None:
+    cursor.execute("PRAGMA table_info(hosts)")
+    existing = {row[1] for row in cursor.fetchall()}
+    if "tags" not in existing:
+        cursor.execute("ALTER TABLE hosts ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
+    if "environment" not in existing:
+        cursor.execute("ALTER TABLE hosts ADD COLUMN environment TEXT")
+    if "business_unit" not in existing:
+        cursor.execute("ALTER TABLE hosts ADD COLUMN business_unit TEXT")
+    cursor.execute("UPDATE hosts SET tags = '[]' WHERE tags IS NULL")
+
+
 def init_db() -> None:
     with get_connection() as conn:
         cursor = conn.cursor()
@@ -43,10 +55,14 @@ def init_db() -> None:
                 operating_system TEXT NOT NULL,
                 protocols TEXT NOT NULL,
                 tls_enabled INTEGER NOT NULL DEFAULT 1,
-                rdp_nla INTEGER NOT NULL DEFAULT 1
+                rdp_nla INTEGER NOT NULL DEFAULT 1,
+                tags TEXT NOT NULL DEFAULT '[]',
+                environment TEXT,
+                business_unit TEXT
             )
             """
         )
+        _ensure_host_columns(cursor)
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS authorizations (

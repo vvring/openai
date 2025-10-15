@@ -11,6 +11,7 @@ from .models import (
     ROLE_ADMIN,
     ROLE_AUDITOR,
     ROLE_OPERATOR,
+    SUPPORTED_ENVIRONMENTS,
     SUPPORTED_PRIVILEGES,
     SUPPORTED_PROTOCOLS,
 )
@@ -40,6 +41,8 @@ def _row_to_user(row) -> Dict:
 
 def _row_to_host(row) -> Dict:
     protocols = _json_loads(row["protocols"])
+    columns = set(row.keys())
+    tags = _json_loads(row["tags"]) if "tags" in columns else None
     return {
         "id": row["id"],
         "name": row["name"],
@@ -49,6 +52,9 @@ def _row_to_host(row) -> Dict:
         "protocols": protocols if isinstance(protocols, list) else [],
         "tls_enabled": bool(row["tls_enabled"]),
         "rdp_nla": bool(row["rdp_nla"]),
+        "tags": tags if isinstance(tags, list) else [],
+        "environment": row["environment"] if "environment" in columns else None,
+        "business_unit": row["business_unit"] if "business_unit" in columns else None,
     }
 
 
@@ -105,6 +111,42 @@ def _validate_protocols(protocols: List[str]) -> None:
 def _validate_privileges(privileges: str) -> None:
     if privileges not in SUPPORTED_PRIVILEGES:
         raise ValidationError(f"Unsupported privileges '{privileges}'")
+
+
+def _validate_environment(environment: Optional[str]) -> None:
+    if environment is None:
+        return
+    if environment not in SUPPORTED_ENVIRONMENTS:
+        raise ValidationError(
+            f"Unsupported environment '{environment}'. Supported values: {sorted(SUPPORTED_ENVIRONMENTS)}"
+        )
+
+
+def _normalize_tags(tags: Optional[List[str]]) -> List[str]:
+    if tags is None:
+        return []
+    if not isinstance(tags, list):
+        raise ValidationError("tags must be provided as a list")
+    normalized: List[str] = []
+    for tag in tags:
+        if not isinstance(tag, str):
+            raise ValidationError("tags must contain only strings")
+        cleaned = tag.strip()
+        if not cleaned:
+            raise ValidationError("tags cannot be empty strings")
+        if len(cleaned) > 50:
+            raise ValidationError("tags cannot exceed 50 characters")
+        normalized.append(cleaned)
+    # Deduplicate while preserving order
+    deduped: List[str] = []
+    seen = set()
+    for tag in normalized:
+        if tag not in seen:
+            deduped.append(tag)
+            seen.add(tag)
+    if len(deduped) > 20:
+        raise ValidationError("no more than 20 tags may be assigned to a host")
+    return deduped
 
 
 def create_user(*, username: str, full_name: str, email: str, roles: List[str] | None = None) -> Dict:
@@ -193,6 +235,9 @@ def create_host(
     protocols: List[str],
     tls_enabled: bool,
     rdp_nla: bool,
+    tags: Optional[List[str]] = None,
+    environment: Optional[str] = None,
+    business_unit: Optional[str] = None,
 ) -> Dict:
     if not name or not hostname or not operating_system:
         raise ValidationError("name, hostname and operating_system are required")
@@ -200,12 +245,25 @@ def create_host(
         raise ValidationError("port must be a positive integer")
     protocols = protocols or []
     _validate_protocols(protocols)
+    _validate_environment(environment)
+    normalized_tags = _normalize_tags(tags)
     with get_connection() as conn:
         try:
             cursor = conn.execute(
                 """
-                INSERT INTO hosts (name, hostname, port, operating_system, protocols, tls_enabled, rdp_nla)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO hosts (
+                    name,
+                    hostname,
+                    port,
+                    operating_system,
+                    protocols,
+                    tls_enabled,
+                    rdp_nla,
+                    tags,
+                    environment,
+                    business_unit
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -215,6 +273,9 @@ def create_host(
                     json.dumps(protocols),
                     int(bool(tls_enabled)),
                     int(bool(rdp_nla)),
+                    json.dumps(normalized_tags),
+                    environment,
+                    business_unit,
                 ),
             )
             conn.commit()
@@ -224,10 +285,33 @@ def create_host(
         return _row_to_host(row)
 
 
-def list_hosts() -> List[Dict]:
+def list_hosts(
+    *,
+    protocol: Optional[str] = None,
+    environment: Optional[str] = None,
+    tag: Optional[str] = None,
+    search: Optional[str] = None,
+) -> List[Dict]:
+    if protocol is not None and protocol not in SUPPORTED_PROTOCOLS:
+        raise ValidationError(f"Unsupported protocol '{protocol}'")
+    _validate_environment(environment)
     with get_connection() as conn:
         rows = conn.execute("SELECT * FROM hosts ORDER BY id ASC").fetchall()
-        return [_row_to_host(row) for row in rows]
+        hosts = [_row_to_host(row) for row in rows]
+    if environment is not None:
+        hosts = [host for host in hosts if host["environment"] == environment]
+    if protocol is not None:
+        hosts = [host for host in hosts if protocol in host["protocols"]]
+    if tag is not None:
+        hosts = [host for host in hosts if tag in host["tags"]]
+    if search is not None:
+        lowered = search.lower()
+        hosts = [
+            host
+            for host in hosts
+            if lowered in host["name"].lower() or lowered in host["hostname"].lower()
+        ]
+    return hosts
 
 
 def get_host(host_id: int) -> Dict:
@@ -248,6 +332,9 @@ def update_host(
     protocols: Optional[List[str]] = None,
     tls_enabled: Optional[bool] = None,
     rdp_nla: Optional[bool] = None,
+    tags: Optional[List[str]] = None,
+    environment: Optional[str] = None,
+    business_unit: Optional[str] = None,
 ) -> Dict:
     if port is not None:
         if not isinstance(port, int) or port <= 0:
@@ -262,6 +349,8 @@ def update_host(
         if not isinstance(protocols, list):
             raise ValidationError("protocols must be provided as a list")
         _validate_protocols(protocols)
+    _validate_environment(environment)
+    normalized_tags = _normalize_tags(tags) if tags is not None else None
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
         if not row:
@@ -291,6 +380,15 @@ def update_host(
         if tls_enabled is not None:
             updates.append("tls_enabled = ?")
             params.append(int(bool(tls_enabled)))
+        if normalized_tags is not None:
+            updates.append("tags = ?")
+            params.append(json.dumps(normalized_tags))
+        if environment is not None:
+            updates.append("environment = ?")
+            params.append(environment)
+        if business_unit is not None:
+            updates.append("business_unit = ?")
+            params.append(business_unit)
         if "rdp" in effective_protocols and not effective_rdp_nla:
             raise ValidationError("Hosts exposing RDP must enable NLA")
         if not updates:

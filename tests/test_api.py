@@ -364,6 +364,80 @@ def test_user_activation_and_host_updates():
     assert resp.status_code == 400
 
 
+def test_host_taxonomy_and_filtering():
+    payloads = [
+        {
+            "name": "prod-gateway",
+            "hostname": "10.0.0.60",
+            "port": 22,
+            "operating_system": "linux",
+            "protocols": ["ssh", "sftp"],
+            "tls_enabled": True,
+            "rdp_nla": True,
+            "tags": ["production", "core"],
+            "environment": "production",
+            "business_unit": "platform",
+        },
+        {
+            "name": "staging-rdp",
+            "hostname": "10.0.0.61",
+            "port": 3389,
+            "operating_system": "windows",
+            "protocols": ["rdp"],
+            "tls_enabled": True,
+            "rdp_nla": True,
+            "tags": ["staging", "rdp"],
+            "environment": "staging",
+            "business_unit": "qa",
+        },
+    ]
+    created = []
+    for payload in payloads:
+        resp = client.post("/hosts", json=payload)
+        assert resp.status_code == 201
+        body = resp.json()
+        assert set(body["tags"]) == set(payload["tags"])
+        assert body["environment"] == payload["environment"]
+        assert body["business_unit"] == payload["business_unit"]
+        created.append(body)
+
+    resp = client.get("/hosts?environment=production")
+    assert resp.status_code == 200
+    assert len(resp.json()) == 1
+    assert resp.json()[0]["name"] == "prod-gateway"
+
+    resp = client.get("/hosts?protocol=rdp")
+    assert resp.status_code == 200
+    names = {host["name"] for host in resp.json()}
+    assert names == {"staging-rdp"}
+
+    resp = client.get("/hosts?tag=core")
+    assert resp.status_code == 200
+    assert {host["name"] for host in resp.json()} == {"prod-gateway"}
+
+    resp = client.get("/hosts?search=10.0.0.6")
+    assert resp.status_code == 200
+    assert {host["name"] for host in resp.json()} == {"prod-gateway", "staging-rdp"}
+
+    host_id = created[0]["id"]
+    resp = client.patch(
+        f"/hosts/{host_id}",
+        json={"tags": ["production", "ssh"], "business_unit": "sre"},
+    )
+    assert resp.status_code == 200
+    updated = resp.json()
+    assert set(updated["tags"]) == {"production", "ssh"}
+    assert updated["business_unit"] == "sre"
+
+    resp = client.get("/hosts?tag=ssh")
+    assert resp.status_code == 200
+    assert {host["name"] for host in resp.json()} == {"prod-gateway"}
+
+    resp = client.get("/hosts?environment=invalid")
+    assert resp.status_code == 400
+    assert "environment" in resp.json()["detail"].lower()
+
+
 def test_session_filters_and_recording_search():
     admin_payload = {
         "username": "filter-admin",

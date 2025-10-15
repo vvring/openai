@@ -17,3 +17,10 @@ SUPPORTED_PRIVILEGES = {
     "read-write",
     "admin",
 }
+
+SUPPORTED_ENVIRONMENTS = {
+    "production",
+    "staging",
+    "testing",
+    "development",
+}

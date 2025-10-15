@@ -26,6 +26,9 @@ class Host:
     protocols: List[str]
     tls_enabled: bool = True
     rdp_nla: bool = True
+    tags: List[str] = field(default_factory=list)
+    environment: Optional[str] = None
+    business_unit: Optional[str] = None
 
 
 @dataclass(slots=True)
