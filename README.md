@@ -4,6 +4,7 @@
 
 - [docs/bastion-system-design.md](docs/bastion-system-design.md)：系统目标、架构与功能规划。
 - `app/`：基于 FastAPI + SQLAlchemy 的堡垒机管理后端原型，覆盖用户/角色、主机授权、会话审计等核心能力。
+- [docs/development-progress.md](docs/development-progress.md)：分阶段开发目标与当前完成情况。
 
 ## 快速开始
 

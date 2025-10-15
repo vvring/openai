@@ -122,3 +122,7 @@
   - 采用 SQLite 默认存储，支持通过 `BASTION_DATABASE_URL` 切换到企业级数据库。
   - 可与未来的协议网关、前端控制台对接，实现完整堡垒机能力闭环。
 
+## 11. 开发进度
+
+系统分阶段开发目标与当前完成情况可参考 [docs/development-progress.md](development-progress.md)。
+
