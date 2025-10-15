@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.7.0")
+app = FastAPI(title="Bastion Management Service", version="0.8.0")
 
 
 def _handle_validation_error(func):
@@ -218,6 +218,80 @@ def update_host(host_id: str, payload: Dict) -> Dict:
     )
 
 
+@app.post("/access-windows", status_code=status.HTTP_201_CREATED)
+@_handle_validation_error
+def create_access_window(payload: Dict) -> Dict:
+    days = payload.get("days_of_week")
+    if days is None or not isinstance(days, list):
+        raise ValidationError("days_of_week must be provided as a list")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    return crud.create_access_window(
+        name=payload.get("name"),
+        allowed_start=payload.get("allowed_start"),
+        allowed_end=payload.get("allowed_end"),
+        days_of_week=days,
+        timezone=payload.get("timezone", "UTC"),
+        description=payload.get("description"),
+        performed_by=parsed_actor,
+    )
+
+
+@app.get("/access-windows")
+@_handle_validation_error
+def list_access_windows(limit: Optional[str] = None, offset: Optional[str] = None) -> List[Dict]:
+    parsed_limit: Optional[int] = None
+    parsed_offset: Optional[int] = None
+    if limit is not None:
+        parsed_limit = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        parsed_offset = _parse_non_negative_int(offset, "offset")
+    return crud.list_access_windows(limit=parsed_limit, offset=parsed_offset)
+
+
+@app.get("/access-windows/{access_window_id}")
+@_handle_validation_error
+def get_access_window(access_window_id: str) -> Dict:
+    return crud.get_access_window(_parse_int(access_window_id, "access_window_id"))
+
+
+@app.patch("/access-windows/{access_window_id}")
+@_handle_validation_error
+def update_access_window(access_window_id: str, payload: Dict) -> Dict:
+    days = payload.get("days_of_week")
+    if days is not None and not isinstance(days, list):
+        raise ValidationError("days_of_week must be provided as a list")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    return crud.update_access_window(
+        _parse_int(access_window_id, "access_window_id"),
+        name=payload.get("name"),
+        allowed_start=payload.get("allowed_start"),
+        allowed_end=payload.get("allowed_end"),
+        days_of_week=days,
+        timezone=payload.get("timezone"),
+        description=payload.get("description"),
+        performed_by=parsed_actor,
+    )
+
+
+@app.delete("/access-windows/{access_window_id}", status_code=status.HTTP_204_NO_CONTENT)
+@_handle_validation_error
+def delete_access_window(access_window_id: str, performed_by: Optional[str] = None):
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    crud.delete_access_window(
+        _parse_int(access_window_id, "access_window_id"),
+        performed_by=parsed_actor,
+    )
+    return None
+
+
 @app.post("/authorizations", status_code=status.HTTP_204_NO_CONTENT)
 @_handle_validation_error
 def assign_authorization(payload: Dict):
@@ -227,10 +301,15 @@ def assign_authorization(payload: Dict):
     parsed_actor: Optional[int] = None
     if performed_by is not None:
         parsed_actor = _parse_int(performed_by, "performed_by")
+    access_window_id = payload.get("access_window_id")
+    parsed_window: Optional[int] = None
+    if access_window_id is not None:
+        parsed_window = _parse_int(access_window_id, "access_window_id")
     crud.authorize_user(
         user_id,
         host_id,
         payload.get("privileges", "read"),
+        access_window_id=parsed_window,
         performed_by=parsed_actor,
     )
     return None
@@ -241,17 +320,21 @@ def assign_authorization(payload: Dict):
 def list_authorizations(
     user_id: Optional[str] = None,
     host_id: Optional[str] = None,
+    access_window_id: Optional[str] = None,
     limit: Optional[str] = None,
     offset: Optional[str] = None,
 ) -> List[Dict]:
     parsed_user: Optional[int] = None
     parsed_host: Optional[int] = None
+    parsed_window: Optional[int] = None
     parsed_limit: Optional[int] = None
     parsed_offset: Optional[int] = None
     if user_id is not None:
         parsed_user = _parse_int(user_id, "user_id")
     if host_id is not None:
         parsed_host = _parse_int(host_id, "host_id")
+    if access_window_id is not None:
+        parsed_window = _parse_int(access_window_id, "access_window_id")
     if limit is not None:
         parsed_limit = _parse_positive_int(limit, "limit")
     if offset is not None:
@@ -259,6 +342,7 @@ def list_authorizations(
     return crud.list_authorizations(
         user_id=parsed_user,
         host_id=parsed_host,
+        access_window_id=parsed_window,
         limit=parsed_limit,
         offset=parsed_offset,
     )

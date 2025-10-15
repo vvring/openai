@@ -30,6 +30,13 @@ def _ensure_host_columns(cursor: sqlite3.Cursor) -> None:
     cursor.execute("UPDATE hosts SET tags = '[]' WHERE tags IS NULL")
 
 
+def _ensure_authorization_columns(cursor: sqlite3.Cursor) -> None:
+    cursor.execute("PRAGMA table_info(authorizations)")
+    existing = {row[1] for row in cursor.fetchall()}
+    if "access_window_id" not in existing:
+        cursor.execute("ALTER TABLE authorizations ADD COLUMN access_window_id INTEGER")
+
+
 def init_db() -> None:
     with get_connection() as conn:
         cursor = conn.cursor()
@@ -70,9 +77,24 @@ def init_db() -> None:
                 user_id INTEGER NOT NULL,
                 host_id INTEGER NOT NULL,
                 privileges TEXT NOT NULL,
+                access_window_id INTEGER,
                 UNIQUE(user_id, host_id),
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE
+            )
+            """
+        )
+        _ensure_authorization_columns(cursor)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS access_windows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                allowed_start TEXT NOT NULL,
+                allowed_end TEXT NOT NULL,
+                days_of_week TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                description TEXT
             )
             """
         )

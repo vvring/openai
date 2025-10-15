@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -19,12 +20,28 @@ client = TestClient(app)
 @pytest.fixture(autouse=True)
 def fresh_database():
     with get_connection() as conn:
-        for table in ("audit_events", "recordings", "sessions", "authorizations", "hosts", "users"):
+        for table in (
+            "audit_events",
+            "recordings",
+            "sessions",
+            "authorizations",
+            "hosts",
+            "users",
+            "access_windows",
+        ):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
     yield
     with get_connection() as conn:
-        for table in ("audit_events", "recordings", "sessions", "authorizations", "hosts", "users"):
+        for table in (
+            "audit_events",
+            "recordings",
+            "sessions",
+            "authorizations",
+            "hosts",
+            "users",
+            "access_windows",
+        ):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
 
@@ -152,6 +169,11 @@ def test_authorization_enforcement_and_listing():
     authorizations = resp.json()
     assert len(authorizations) == 1
     assert authorizations[0]["privileges"] == "read"
+    assert authorizations[0]["access_window_id"] is None
+
+    resp = client.get(f"/authorizations?access_window_id=1")
+    assert resp.status_code == 200
+    assert resp.json() == []
 
     resp = client.post(
         "/sessions",
@@ -279,6 +301,142 @@ def test_protocol_and_nla_enforcement():
         json={"user_id": admin_id, "host_id": host_id, "protocol": "ssh"},
     )
     assert resp.status_code == 201, resp.text
+
+
+def test_access_window_crud_and_enforcement():
+    admin_resp = client.post(
+        "/users",
+        json={
+            "username": "schedule-admin",
+            "full_name": "Schedule Admin",
+            "email": "sched-admin@example.com",
+            "roles": ["admin"],
+        },
+    )
+    admin_id = admin_resp.json()["id"]
+
+    operator_resp = client.post(
+        "/users",
+        json={
+            "username": "window-operator",
+            "full_name": "Window Operator",
+            "email": "window-op@example.com",
+            "roles": ["operator"],
+        },
+    )
+    operator_id = operator_resp.json()["id"]
+
+    host_resp = client.post(
+        "/hosts",
+        json={
+            "name": "window-host",
+            "hostname": "10.0.0.200",
+            "port": 22,
+            "operating_system": "linux",
+            "protocols": ["ssh"],
+            "tls_enabled": True,
+            "rdp_nla": True,
+        },
+    )
+    host_id = host_resp.json()["id"]
+
+    current_weekday = datetime.now().strftime("%A").lower()
+    all_days = [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    ]
+    restricted_day = next(day for day in all_days if day != current_weekday)
+
+    create_resp = client.post(
+        "/access-windows",
+        json={
+            "name": "Business Hours",
+            "allowed_start": "00:00",
+            "allowed_end": "23:59",
+            "days_of_week": [current_weekday],
+            "performed_by": admin_id,
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    access_window = create_resp.json()
+    access_window_id = access_window["id"]
+    assert current_weekday in access_window["days_of_week"]
+
+    list_resp = client.get("/access-windows")
+    assert list_resp.status_code == 200
+    assert list_resp.json()[0]["id"] == access_window_id
+
+    detail_resp = client.get(f"/access-windows/{access_window_id}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["name"] == "Business Hours"
+
+    assign_resp = client.post(
+        "/authorizations",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "privileges": "read",
+            "access_window_id": access_window_id,
+            "performed_by": admin_id,
+        },
+    )
+    assert assign_resp.status_code == 204, assign_resp.text
+
+    session_resp = client.post(
+        "/sessions",
+        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+    )
+    assert session_resp.status_code == 201, session_resp.text
+
+    update_resp = client.patch(
+        f"/access-windows/{access_window_id}",
+        json={
+            "days_of_week": [restricted_day],
+            "performed_by": admin_id,
+        },
+    )
+    assert update_resp.status_code == 200, update_resp.text
+    assert update_resp.json()["days_of_week"] == [restricted_day]
+
+    denied_resp = client.post(
+        "/sessions",
+        json={"user_id": operator_id, "host_id": host_id, "protocol": "ssh"},
+    )
+    assert denied_resp.status_code == 400
+    assert "weekday" in denied_resp.json()["detail"].lower() or "time" in denied_resp.json()["detail"].lower()
+
+    delete_resp = client.delete(f"/access-windows/{access_window_id}")
+    assert delete_resp.status_code == 400
+    assert "assigned" in delete_resp.json()["detail"].lower()
+
+    reassigned_resp = client.post(
+        "/authorizations",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "privileges": "read",
+            "performed_by": admin_id,
+        },
+    )
+    assert reassigned_resp.status_code == 204, reassigned_resp.text
+
+    delete_resp = client.delete(
+        f"/access-windows/{access_window_id}?performed_by={admin_id}"
+    )
+    assert delete_resp.status_code == 204, delete_resp.text
+
+    list_resp = client.get("/access-windows")
+    assert list_resp.status_code == 200
+    assert list_resp.json() == []
+
+    filter_resp = client.get(f"/authorizations?access_window_id={access_window_id}")
+    assert filter_resp.status_code == 200
+    assert filter_resp.json() == []
 
 
 def test_audit_event_catalog():

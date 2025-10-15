@@ -37,6 +37,18 @@ class Authorization:
     user_id: int
     host_id: int
     privileges: str
+    access_window_id: Optional[int] = None
+
+
+@dataclass(slots=True)
+class AccessWindow:
+    id: int
+    name: str
+    allowed_start: str
+    allowed_end: str
+    days_of_week: List[str]
+    timezone: str
+    description: Optional[str] = None
 
 
 @dataclass(slots=True)

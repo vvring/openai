@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .database import get_connection
 from .models import (
@@ -64,6 +66,7 @@ def _row_to_authorization(row) -> Dict:
         "user_id": row["user_id"],
         "host_id": row["host_id"],
         "privileges": row["privileges"],
+        "access_window_id": row["access_window_id"],
     }
 
 
@@ -106,6 +109,32 @@ def _row_to_audit_event(row) -> Dict:
         "metadata": metadata,
         "created_at": row["created_at"],
     }
+
+
+def _row_to_access_window(row) -> Dict:
+    days = _json_loads(row["days_of_week"]) or []
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "allowed_start": row["allowed_start"],
+        "allowed_end": row["allowed_end"],
+        "days_of_week": days if isinstance(days, list) else [],
+        "timezone": row["timezone"],
+        "description": row["description"],
+    }
+
+
+_VALID_WEEKDAYS = [
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+]
+
+_VALID_WEEKDAY_SET = set(_VALID_WEEKDAYS)
 
 
 def _validate_pagination(limit: Optional[int], offset: Optional[int]) -> None:
@@ -197,6 +226,124 @@ def _ensure_actor(conn: sqlite3.Connection, actor_id: Optional[int]) -> Optional
     return actor_int
 
 
+def _parse_time_of_day(value: str, field: str) -> time:
+    if not isinstance(value, str):
+        raise ValidationError(f"{field} must be a HH:MM string")
+    try:
+        parsed = datetime.strptime(value, "%H:%M").time()
+    except ValueError as exc:
+        raise ValidationError(f"{field} must be formatted as HH:MM (24h)") from exc
+    return parsed
+
+
+def _normalize_days_of_week(days: List[str]) -> List[str]:
+    if not isinstance(days, list) or not days:
+        raise ValidationError("days_of_week must be a non-empty list of weekdays")
+    normalized: List[str] = []
+    seen = set()
+    for day in days:
+        if not isinstance(day, str):
+            raise ValidationError("days_of_week must contain only strings")
+        lowered = day.strip().lower()
+        if lowered not in _VALID_WEEKDAY_SET:
+            raise ValidationError(
+                "days_of_week must contain valid weekday names (e.g. monday, tuesday)"
+            )
+        if lowered not in seen:
+            normalized.append(lowered)
+            seen.add(lowered)
+    # Preserve canonical order for determinism
+    ordered = [day for day in _VALID_WEEKDAYS if day in seen]
+    return ordered
+
+
+def _ensure_timezone(value: str) -> str:
+    tz_value = value or "UTC"
+    if not isinstance(tz_value, str):
+        raise ValidationError("timezone must be a string")
+    try:
+        ZoneInfo(tz_value)
+    except ZoneInfoNotFoundError as exc:
+        raise ValidationError(f"Unknown timezone '{tz_value}'") from exc
+    return tz_value
+
+
+def _ensure_access_window(conn: sqlite3.Connection, access_window_id: Optional[int]) -> Optional[Dict]:
+    if access_window_id is None:
+        return None
+    row = conn.execute(
+        "SELECT * FROM access_windows WHERE id = ?",
+        (access_window_id,),
+    ).fetchone()
+    if not row:
+        raise ValidationError(f"Access window {access_window_id} not found")
+    return _row_to_access_window(row)
+
+
+def _validate_access_window_payload(
+    *,
+    name: Optional[str] = None,
+    allowed_start: Optional[str] = None,
+    allowed_end: Optional[str] = None,
+    days_of_week: Optional[List[str]] = None,
+    timezone: Optional[str] = None,
+    description: Optional[str] = None,
+    allow_partial: bool = False,
+) -> Dict:
+    if not allow_partial:
+        if not name or not isinstance(name, str):
+            raise ValidationError("name is required")
+        if allowed_start is None or allowed_end is None:
+            raise ValidationError("allowed_start and allowed_end are required")
+        if days_of_week is None:
+            raise ValidationError("days_of_week is required")
+    updates: Dict[str, Any] = {}
+    if name is not None:
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError("name must be a non-empty string")
+        if len(name.strip()) > 100:
+            raise ValidationError("name cannot exceed 100 characters")
+        updates["name"] = name.strip()
+    parsed_start: Optional[time] = None
+    parsed_end: Optional[time] = None
+    if allowed_start is not None:
+        parsed_start = _parse_time_of_day(allowed_start, "allowed_start")
+        updates["allowed_start"] = parsed_start.strftime("%H:%M")
+    if allowed_end is not None:
+        parsed_end = _parse_time_of_day(allowed_end, "allowed_end")
+        updates["allowed_end"] = parsed_end.strftime("%H:%M")
+    if parsed_start and parsed_end and parsed_start >= parsed_end:
+        raise ValidationError("allowed_end must be later than allowed_start")
+    if days_of_week is not None:
+        normalized_days = _normalize_days_of_week(days_of_week)
+        updates["days_of_week"] = normalized_days
+    if timezone is not None:
+        updates["timezone"] = _ensure_timezone(timezone)
+    if description is not None:
+        if description and not isinstance(description, str):
+            raise ValidationError("description must be a string if provided")
+        updates["description"] = description.strip() if isinstance(description, str) else None
+    return updates
+
+
+def _enforce_access_window(conn: sqlite3.Connection, auth_row) -> None:
+    access_window_id = auth_row["access_window_id"]
+    if access_window_id is None:
+        return
+    window = _ensure_access_window(conn, access_window_id)
+    now_utc = datetime.now(tz=timezone.utc)
+    tz = ZoneInfo(window["timezone"])
+    now_local = now_utc.astimezone(tz)
+    weekday = now_local.strftime("%A").lower()
+    if weekday not in window["days_of_week"]:
+        raise ValidationError("Access is not permitted on the current weekday")
+    allowed_start = _parse_time_of_day(window["allowed_start"], "allowed_start")
+    allowed_end = _parse_time_of_day(window["allowed_end"], "allowed_end")
+    current_time = now_local.time().replace(second=0, microsecond=0)
+    if current_time < allowed_start or current_time >= allowed_end:
+        raise ValidationError("Access is not permitted at the current time")
+
+
 def _record_audit_event(
     conn: sqlite3.Connection,
     *,
@@ -227,6 +374,189 @@ def _record_audit_event(
             created_at,
         ),
     )
+
+
+def create_access_window(
+    *,
+    name: str,
+    allowed_start: str,
+    allowed_end: str,
+    days_of_week: List[str],
+    timezone: str = "UTC",
+    description: Optional[str] = None,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    validated = _validate_access_window_payload(
+        name=name,
+        allowed_start=allowed_start,
+        allowed_end=allowed_end,
+        days_of_week=days_of_week,
+        timezone=timezone,
+        description=description,
+    )
+    if "timezone" not in validated:
+        validated["timezone"] = _ensure_timezone("UTC")
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO access_windows (name, allowed_start, allowed_end, days_of_week, timezone, description)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    validated["name"],
+                    validated["allowed_start"],
+                    validated["allowed_end"],
+                    json.dumps(validated["days_of_week"]),
+                    validated.get("timezone", "UTC"),
+                    validated.get("description"),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("Access window name already exists") from exc
+        window_id = cursor.lastrowid
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="access_window.created",
+            target_type="access_window",
+            target_id=window_id,
+            metadata={
+                "name": validated["name"],
+                "allowed_start": validated["allowed_start"],
+                "allowed_end": validated["allowed_end"],
+                "days_of_week": validated["days_of_week"],
+                "timezone": validated.get("timezone", "UTC"),
+            },
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM access_windows WHERE id = ?", (window_id,)).fetchone()
+        return _row_to_access_window(row)
+
+
+def list_access_windows(
+    *,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> List[Dict]:
+    _validate_pagination(limit, offset)
+    with get_connection() as conn:
+        query = "SELECT * FROM access_windows ORDER BY id ASC"
+        params: List[Any] = []
+        query, params = _apply_pagination(query, params, limit, offset)
+        rows = conn.execute(query, tuple(params)).fetchall()
+        return [_row_to_access_window(row) for row in rows]
+
+
+def get_access_window(access_window_id: int) -> Dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM access_windows WHERE id = ?",
+            (access_window_id,),
+        ).fetchone()
+        if not row:
+            raise ValidationError(f"Access window {access_window_id} not found")
+        return _row_to_access_window(row)
+
+
+def update_access_window(
+    access_window_id: int,
+    *,
+    name: Optional[str] = None,
+    allowed_start: Optional[str] = None,
+    allowed_end: Optional[str] = None,
+    days_of_week: Optional[List[str]] = None,
+    timezone: Optional[str] = None,
+    description: Optional[str] = None,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    validated = _validate_access_window_payload(
+        name=name,
+        allowed_start=allowed_start,
+        allowed_end=allowed_end,
+        days_of_week=days_of_week,
+        timezone=timezone,
+        description=description,
+        allow_partial=True,
+    )
+    if not validated:
+        raise ValidationError("No fields provided for update")
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        existing_row = conn.execute(
+            "SELECT * FROM access_windows WHERE id = ?",
+            (access_window_id,),
+        ).fetchone()
+        if not existing_row:
+            raise ValidationError(f"Access window {access_window_id} not found")
+        current = _row_to_access_window(existing_row)
+        start_value = validated.get("allowed_start", current["allowed_start"])
+        end_value = validated.get("allowed_end", current["allowed_end"])
+        if start_value is not None and end_value is not None:
+            start_time = _parse_time_of_day(start_value, "allowed_start")
+            end_time = _parse_time_of_day(end_value, "allowed_end")
+            if start_time >= end_time:
+                raise ValidationError("allowed_end must be later than allowed_start")
+        assignments: List[str] = []
+        params: List[Any] = []
+        metadata_changes: Dict[str, Any] = {}
+        for field, value in validated.items():
+            if field == "days_of_week":
+                assignments.append("days_of_week = ?")
+                params.append(json.dumps(value))
+                metadata_changes[field] = value
+            else:
+                assignments.append(f"{field} = ?")
+                params.append(value)
+                metadata_changes[field] = value
+        params.append(access_window_id)
+        conn.execute(
+            f"UPDATE access_windows SET {', '.join(assignments)} WHERE id = ?",
+            tuple(params),
+        )
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="access_window.updated",
+            target_type="access_window",
+            target_id=access_window_id,
+            metadata=metadata_changes,
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM access_windows WHERE id = ?", (access_window_id,)).fetchone()
+        return _row_to_access_window(row)
+
+
+def delete_access_window(
+    access_window_id: int,
+    *,
+    performed_by: Optional[int] = None,
+) -> None:
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        row = conn.execute(
+            "SELECT * FROM access_windows WHERE id = ?",
+            (access_window_id,),
+        ).fetchone()
+        if not row:
+            raise ValidationError(f"Access window {access_window_id} not found")
+        usage = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM authorizations WHERE access_window_id = ?",
+            (access_window_id,),
+        ).fetchone()
+        if usage["cnt"]:
+            raise ValidationError("Access window is still assigned to authorizations")
+        conn.execute("DELETE FROM access_windows WHERE id = ?", (access_window_id,))
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="access_window.deleted",
+            target_type="access_window",
+            target_id=access_window_id,
+            metadata=None,
+        )
+        conn.commit()
 
 
 def create_user(
@@ -573,6 +903,7 @@ def authorize_user(
     host_id: int,
     privileges: str,
     *,
+    access_window_id: Optional[int] = None,
     performed_by: Optional[int] = None,
 ) -> None:
     if not privileges:
@@ -586,17 +917,26 @@ def authorize_user(
             raise ValidationError(f"User {user_id} not found")
         if not host:
             raise ValidationError(f"Host {host_id} not found")
+        window_id: Optional[int] = None
+        if access_window_id is not None:
+            try:
+                window_id = int(access_window_id)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("access_window_id must be an integer") from exc
+            _ensure_access_window(conn, window_id)
         existing = conn.execute(
             "SELECT * FROM authorizations WHERE user_id = ? AND host_id = ?",
             (user_id, host_id),
         ).fetchone()
         conn.execute(
             """
-            INSERT INTO authorizations (user_id, host_id, privileges)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, host_id) DO UPDATE SET privileges = excluded.privileges
+            INSERT INTO authorizations (user_id, host_id, privileges, access_window_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, host_id) DO UPDATE SET
+                privileges = excluded.privileges,
+                access_window_id = excluded.access_window_id
             """,
-            (user_id, host_id, privileges),
+            (user_id, host_id, privileges, window_id),
         )
         row = conn.execute(
             "SELECT * FROM authorizations WHERE user_id = ? AND host_id = ?",
@@ -609,7 +949,7 @@ def authorize_user(
             action=action,
             target_type="authorization",
             target_id=row["id"] if row else None,
-            metadata={"privileges": privileges},
+            metadata={"privileges": privileges, "access_window_id": row["access_window_id"]},
         )
         conn.commit()
 
@@ -618,6 +958,7 @@ def list_authorizations(
     *,
     user_id: Optional[int] = None,
     host_id: Optional[int] = None,
+    access_window_id: Optional[int] = None,
     limit: Optional[int] = None,
     offset: Optional[int] = None,
 ) -> List[Dict]:
@@ -631,6 +972,9 @@ def list_authorizations(
         if host_id is not None:
             clauses.append("host_id = ?")
             params.append(host_id)
+        if access_window_id is not None:
+            clauses.append("access_window_id = ?")
+            params.append(access_window_id)
         if clauses:
             query = "SELECT * FROM authorizations WHERE " + " AND ".join(clauses) + " ORDER BY id ASC"
         else:
@@ -659,7 +1003,11 @@ def revoke_authorization(authorization_id: int, *, performed_by: Optional[int] =
             action="authorization.revoked",
             target_type="authorization",
             target_id=authorization_id,
-            metadata={"user_id": row["user_id"], "host_id": row["host_id"]},
+            metadata={
+                "user_id": row["user_id"],
+                "host_id": row["host_id"],
+                "access_window_id": row["access_window_id"],
+            },
         )
         conn.commit()
 
@@ -687,6 +1035,7 @@ def start_session(*, user_id: int, host_id: int, protocol: str) -> Dict:
             ).fetchone()
             if not auth:
                 raise ValidationError("User does not have access to the requested host")
+            _enforce_access_window(conn, auth)
         started_at = datetime.now(tz=timezone.utc).isoformat()
         cursor = conn.execute(
             """
