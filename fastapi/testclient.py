@@ -43,5 +43,8 @@ class TestClient:
     def get(self, path: str) -> _Response:
         return self._request("GET", path)
 
+    def patch(self, path: str, json: Optional[Dict[str, Any]] = None) -> _Response:
+        return self._request("PATCH", path, json)
+
     def delete(self, path: str) -> _Response:
         return self._request("DELETE", path)

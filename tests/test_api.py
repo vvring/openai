@@ -281,6 +281,88 @@ def test_protocol_and_nla_enforcement():
     assert resp.status_code == 201, resp.text
 
 
+def test_user_activation_and_host_updates():
+    user_payload = {
+        "username": "eve",
+        "full_name": "Eve Operator",
+        "email": "eve@example.com",
+        "roles": ["operator"],
+    }
+    resp = client.post("/users", json=user_payload)
+    assert resp.status_code == 201, resp.text
+    user = resp.json()
+    user_id = user["id"]
+
+    resp = client.get(f"/users/{user_id}")
+    assert resp.status_code == 200
+    assert resp.json()["username"] == "eve"
+
+    resp = client.patch(
+        f"/users/{user_id}",
+        json={"full_name": "Evelyn Operator", "roles": ["operator", "auditor"]},
+    )
+    assert resp.status_code == 200
+    updated_user = resp.json()
+    assert updated_user["full_name"] == "Evelyn Operator"
+    assert set(updated_user["roles"]) == {"operator", "auditor"}
+
+    resp = client.patch(f"/users/{user_id}", json={"is_active": False})
+    assert resp.status_code == 200
+    assert resp.json()["is_active"] is False
+
+    host_payload = {
+        "name": "app-host",
+        "hostname": "10.0.0.40",
+        "port": 22,
+        "operating_system": "linux",
+        "protocols": ["ssh"],
+        "tls_enabled": True,
+        "rdp_nla": True,
+    }
+    resp = client.post("/hosts", json=host_payload)
+    assert resp.status_code == 201
+    host_id = resp.json()["id"]
+
+    resp = client.post(
+        "/authorizations",
+        json={"user_id": user_id, "host_id": host_id, "privileges": "read-write"},
+    )
+    assert resp.status_code == 204
+
+    resp = client.post(
+        "/sessions",
+        json={"user_id": user_id, "host_id": host_id, "protocol": "ssh"},
+    )
+    assert resp.status_code == 400
+    assert "inactive" in resp.json()["detail"]
+
+    resp = client.patch(f"/users/{user_id}", json={"is_active": True})
+    assert resp.status_code == 200
+
+    resp = client.post(
+        "/sessions",
+        json={"user_id": user_id, "host_id": host_id, "protocol": "ssh"},
+    )
+    assert resp.status_code == 201
+
+    resp = client.patch(
+        f"/hosts/{host_id}",
+        json={"protocols": ["ssh", "rdp"], "rdp_nla": True},
+    )
+    assert resp.status_code == 200
+    assert set(resp.json()["protocols"]) == {"ssh", "rdp"}
+
+    resp = client.patch(f"/hosts/{host_id}", json={"port": 2222})
+    assert resp.status_code == 200
+    assert resp.json()["port"] == 2222
+
+    resp = client.patch(f"/hosts/{host_id}", json={"rdp_nla": False})
+    assert resp.status_code == 400
+    assert "NLA" in resp.json()["detail"]
+
+    resp = client.patch(f"/users/{user_id}", json={"roles": ["invalid"]})
+    assert resp.status_code == 400
+
 @pytest.fixture(autouse=True, scope='module')
 def cleanup_db():
     yield

@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.2.0")
+app = FastAPI(title="Bastion Management Service", version="0.3.0")
 
 
 def _handle_validation_error(func):
@@ -44,6 +44,30 @@ def get_users() -> List[Dict]:
     return crud.list_users()
 
 
+@app.get("/users/{user_id}")
+@_handle_validation_error
+def get_user(user_id: str) -> Dict:
+    return crud.get_user(_parse_int(user_id, "user_id"))
+
+
+@app.patch("/users/{user_id}")
+@_handle_validation_error
+def update_user(user_id: str, payload: Dict) -> Dict:
+    roles = payload.get("roles")
+    if roles is not None and not isinstance(roles, list):
+        raise ValidationError("roles must be provided as a list")
+    is_active = payload.get("is_active")
+    if is_active is not None and not isinstance(is_active, bool):
+        raise ValidationError("is_active must be a boolean")
+    return crud.update_user(
+        _parse_int(user_id, "user_id"),
+        full_name=payload.get("full_name"),
+        email=payload.get("email"),
+        roles=roles,
+        is_active=is_active,
+    )
+
+
 @app.post("/hosts", status_code=status.HTTP_201_CREATED)
 @_handle_validation_error
 def create_host(payload: Dict) -> Dict:
@@ -61,6 +85,40 @@ def create_host(payload: Dict) -> Dict:
 @app.get("/hosts")
 def get_hosts() -> List[Dict]:
     return crud.list_hosts()
+
+
+@app.get("/hosts/{host_id}")
+@_handle_validation_error
+def get_host(host_id: str) -> Dict:
+    return crud.get_host(_parse_int(host_id, "host_id"))
+
+
+@app.patch("/hosts/{host_id}")
+@_handle_validation_error
+def update_host(host_id: str, payload: Dict) -> Dict:
+    protocols = payload.get("protocols")
+    if protocols is not None and not isinstance(protocols, list):
+        raise ValidationError("protocols must be provided as a list")
+    tls_enabled = payload.get("tls_enabled")
+    if tls_enabled is not None and not isinstance(tls_enabled, bool):
+        raise ValidationError("tls_enabled must be a boolean")
+    rdp_nla = payload.get("rdp_nla")
+    if rdp_nla is not None and not isinstance(rdp_nla, bool):
+        raise ValidationError("rdp_nla must be a boolean")
+    port = payload.get("port")
+    parsed_port: Optional[int] = None
+    if port is not None:
+        parsed_port = _parse_int(port, "port")
+    return crud.update_host(
+        _parse_int(host_id, "host_id"),
+        name=payload.get("name"),
+        hostname=payload.get("hostname"),
+        port=parsed_port,
+        operating_system=payload.get("operating_system"),
+        protocols=protocols,
+        tls_enabled=tls_enabled,
+        rdp_nla=rdp_nla,
+    )
 
 
 @app.post("/authorizations", status_code=status.HTTP_204_NO_CONTENT)

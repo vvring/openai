@@ -62,6 +62,15 @@ class FastAPI:
 
         return decorator
 
+    def patch(self, path: str, *, response_model: Any = None, status_code: int = 200):
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            self._routes.append(
+                Route("PATCH", path, handler=func, status_code=status_code, expects_body=True)
+            )
+            return func
+
+        return decorator
+
     def delete(self, path: str, *, response_model: Any = None, status_code: int = 200):
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             self._routes.append(

@@ -131,6 +131,59 @@ def list_users() -> List[Dict]:
         return [_row_to_user(row) for row in rows]
 
 
+def get_user(user_id: int) -> Dict:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise ValidationError(f"User {user_id} not found")
+        return _row_to_user(row)
+
+
+def update_user(
+    user_id: int,
+    *,
+    full_name: Optional[str] = None,
+    email: Optional[str] = None,
+    roles: Optional[List[str]] = None,
+    is_active: Optional[bool] = None,
+) -> Dict:
+    if roles is not None:
+        if not isinstance(roles, list):
+            raise ValidationError("roles must be provided as a list")
+        _validate_roles(roles)
+    if full_name is not None and not full_name:
+        raise ValidationError("full_name cannot be empty")
+    if email is not None and not email:
+        raise ValidationError("email cannot be empty")
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise ValidationError(f"User {user_id} not found")
+        updates: List[str] = []
+        params: List[object] = []
+        if full_name is not None:
+            updates.append("full_name = ?")
+            params.append(full_name)
+        if email is not None:
+            updates.append("email = ?")
+            params.append(email)
+        if roles is not None:
+            updates.append("roles = ?")
+            params.append(json.dumps(roles))
+        if is_active is not None:
+            updates.append("is_active = ?")
+            params.append(int(bool(is_active)))
+        if not updates:
+            raise ValidationError("No fields provided for update")
+        conn.execute(
+            f"UPDATE users SET {', '.join(updates)} WHERE id = ?",
+            (*params, user_id),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return _row_to_user(row)
+
+
 def create_host(
     *,
     name: str,
@@ -175,6 +228,83 @@ def list_hosts() -> List[Dict]:
     with get_connection() as conn:
         rows = conn.execute("SELECT * FROM hosts ORDER BY id ASC").fetchall()
         return [_row_to_host(row) for row in rows]
+
+
+def get_host(host_id: int) -> Dict:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
+        if not row:
+            raise ValidationError(f"Host {host_id} not found")
+        return _row_to_host(row)
+
+
+def update_host(
+    host_id: int,
+    *,
+    name: Optional[str] = None,
+    hostname: Optional[str] = None,
+    port: Optional[int] = None,
+    operating_system: Optional[str] = None,
+    protocols: Optional[List[str]] = None,
+    tls_enabled: Optional[bool] = None,
+    rdp_nla: Optional[bool] = None,
+) -> Dict:
+    if port is not None:
+        if not isinstance(port, int) or port <= 0:
+            raise ValidationError("port must be a positive integer")
+    if name is not None and not name:
+        raise ValidationError("name cannot be empty")
+    if hostname is not None and not hostname:
+        raise ValidationError("hostname cannot be empty")
+    if operating_system is not None and not operating_system:
+        raise ValidationError("operating_system cannot be empty")
+    if protocols is not None:
+        if not isinstance(protocols, list):
+            raise ValidationError("protocols must be provided as a list")
+        _validate_protocols(protocols)
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
+        if not row:
+            raise ValidationError(f"Host {host_id} not found")
+        updates: List[str] = []
+        params: List[object] = []
+        if name is not None:
+            updates.append("name = ?")
+            params.append(name)
+        if hostname is not None:
+            updates.append("hostname = ?")
+            params.append(hostname)
+        if port is not None:
+            updates.append("port = ?")
+            params.append(port)
+        if operating_system is not None:
+            updates.append("operating_system = ?")
+            params.append(operating_system)
+        effective_protocols = protocols if protocols is not None else _json_loads(row["protocols"]) or []
+        if protocols is not None:
+            updates.append("protocols = ?")
+            params.append(json.dumps(protocols))
+        effective_rdp_nla = bool(row["rdp_nla"]) if rdp_nla is None else bool(rdp_nla)
+        if rdp_nla is not None:
+            updates.append("rdp_nla = ?")
+            params.append(int(bool(rdp_nla)))
+        if tls_enabled is not None:
+            updates.append("tls_enabled = ?")
+            params.append(int(bool(tls_enabled)))
+        if "rdp" in effective_protocols and not effective_rdp_nla:
+            raise ValidationError("Hosts exposing RDP must enable NLA")
+        if not updates:
+            raise ValidationError("No fields provided for update")
+        try:
+            conn.execute(
+                f"UPDATE hosts SET {', '.join(updates)} WHERE id = ?",
+                (*params, host_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("Host already exists") from exc
+        conn.commit()
+        row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
+        return _row_to_host(row)
 
 
 def authorize_user(user_id: int, host_id: int, privileges: str) -> None:
