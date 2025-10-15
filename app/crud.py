@@ -1,11 +1,15 @@
 """CRUD helpers implemented on top of sqlite3."""
 from __future__ import annotations
 
+import fnmatch
 import ipaddress
 import json
 import sqlite3
 from datetime import datetime, time, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+
+UNSET = object()
 
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -98,6 +102,9 @@ def _row_to_authorization(row) -> Dict:
         "source_cidrs": _json_loads(row["source_cidrs"]) or []
         if "source_cidrs" in row.keys()
         else [],
+        "command_policy_id": row["command_policy_id"]
+        if "command_policy_id" in row.keys()
+        else None,
     }
 
 
@@ -192,6 +199,19 @@ def _row_to_access_window(row) -> Dict:
         "days_of_week": days if isinstance(days, list) else [],
         "timezone": row["timezone"],
         "description": row["description"],
+    }
+
+
+def _row_to_command_policy(row) -> Dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "description": row["description"],
+        "allowed_patterns": _json_loads(row["allowed_patterns"]) or [],
+        "denied_patterns": _json_loads(row["denied_patterns"]) or [],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "created_by": row["created_by"],
     }
 
 
@@ -386,6 +406,29 @@ def _normalize_tags(tags: Optional[List[str]]) -> List[str]:
     return deduped
 
 
+def _normalize_command_patterns(patterns: Optional[List[str]], field: str) -> List[str]:
+    if patterns is None:
+        return []
+    if not isinstance(patterns, list):
+        raise ValidationError(f"{field} must be provided as a list")
+    normalized: List[str] = []
+    seen = set()
+    for pattern in patterns:
+        if not isinstance(pattern, str):
+            raise ValidationError(f"{field} must contain only strings")
+        cleaned = pattern.strip()
+        if not cleaned:
+            raise ValidationError(f"{field} cannot contain empty strings")
+        if len(cleaned) > 200:
+            raise ValidationError(f"{field} entries cannot exceed 200 characters")
+        if cleaned not in seen:
+            normalized.append(cleaned)
+            seen.add(cleaned)
+    if len(normalized) > 100:
+        raise ValidationError(f"{field} cannot contain more than 100 entries")
+    return normalized
+
+
 def _require_non_empty_string(value: Optional[str], field: str, *, max_length: Optional[int] = None) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{field} must be a non-empty string")
@@ -393,6 +436,26 @@ def _require_non_empty_string(value: Optional[str], field: str, *, max_length: O
     if max_length is not None and len(cleaned) > max_length:
         raise ValidationError(f"{field} cannot exceed {max_length} characters")
     return cleaned
+
+
+def _normalize_requested_commands(commands: Optional[List[str]]) -> List[str]:
+    if commands is None:
+        return []
+    if not isinstance(commands, list):
+        raise ValidationError("requested_commands must be provided as a list")
+    normalized: List[str] = []
+    for command in commands:
+        if not isinstance(command, str):
+            raise ValidationError("requested_commands must contain only strings")
+        cleaned = command.strip()
+        if not cleaned:
+            raise ValidationError("requested_commands cannot contain empty commands")
+        if len(cleaned) > 1024:
+            raise ValidationError("requested_commands entries cannot exceed 1024 characters")
+        normalized.append(cleaned)
+    if len(normalized) > 50:
+        raise ValidationError("requested_commands cannot contain more than 50 entries")
+    return normalized
 
 
 def _ensure_actor(conn: sqlite3.Connection, actor_id: Optional[int]) -> Optional[int]:
@@ -523,6 +586,20 @@ def _ensure_access_window(conn: sqlite3.Connection, access_window_id: Optional[i
     return _row_to_access_window(row)
 
 
+def _ensure_command_policy(
+    conn: sqlite3.Connection, command_policy_id: Optional[int]
+) -> Optional[Dict]:
+    if command_policy_id is None:
+        return None
+    row = conn.execute(
+        "SELECT * FROM command_policies WHERE id = ?",
+        (command_policy_id,),
+    ).fetchone()
+    if not row:
+        raise ValidationError(f"Command policy {command_policy_id} not found")
+    return _row_to_command_policy(row)
+
+
 def _validate_access_window_payload(
     *,
     name: Optional[str] = None,
@@ -607,6 +684,40 @@ def _enforce_access_request(conn: sqlite3.Connection, authorization_id: int, use
         now = datetime.now(tz=timezone.utc)
         if expires_dt < now:
             raise ValidationError("Access approval has expired")
+
+
+def _enforce_command_policy(
+    conn: sqlite3.Connection,
+    policy_id: Optional[int],
+    commands: List[str],
+) -> None:
+    if not policy_id:
+        return
+    row = conn.execute(
+        "SELECT * FROM command_policies WHERE id = ?",
+        (policy_id,),
+    ).fetchone()
+    if not row:
+        raise ValidationError(
+            "Command policy referenced by the authorization is no longer available"
+        )
+    policy = _row_to_command_policy(row)
+    allowed = policy["allowed_patterns"]
+    denied = policy["denied_patterns"]
+    if (allowed or denied) and not commands:
+        raise ValidationError(
+            "requested_commands must be provided when a command policy is enforced"
+        )
+    for command in commands:
+        for pattern in denied:
+            if fnmatch.fnmatchcase(command, pattern):
+                raise ValidationError(
+                    f"Command '{command}' violates denied pattern '{pattern}'"
+                )
+        if allowed and not any(fnmatch.fnmatchcase(command, pattern) for pattern in allowed):
+            raise ValidationError(
+                f"Command '{command}' is not permitted by the assigned policy"
+            )
 
 
 def _record_audit_event(
@@ -1390,6 +1501,216 @@ def remove_host_from_group(
         return payload
 
 
+def create_command_policy(
+    *,
+    name: str,
+    description: Optional[str] = None,
+    allowed_patterns: Optional[List[str]] = None,
+    denied_patterns: Optional[List[str]] = None,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    normalized_name = _require_non_empty_string(name, "name", max_length=120)
+    normalized_description: Optional[str] = None
+    if description is not None:
+        if description != "" and not isinstance(description, str):
+            raise ValidationError("description must be a string if provided")
+        normalized_description = description.strip() if isinstance(description, str) else None
+        if normalized_description == "":
+            normalized_description = None
+    allow_list = _normalize_command_patterns(allowed_patterns, "allowed_patterns")
+    deny_list = _normalize_command_patterns(denied_patterns, "denied_patterns")
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        cursor = conn.cursor()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO command_policies (
+                    name,
+                    description,
+                    allowed_patterns,
+                    denied_patterns,
+                    created_at,
+                    updated_at,
+                    created_by
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_name,
+                    normalized_description,
+                    json.dumps(allow_list),
+                    json.dumps(deny_list),
+                    now,
+                    now,
+                    actor_id,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("Command policy name already exists") from exc
+        policy_id = cursor.lastrowid
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="command_policy.created",
+            target_type="command_policy",
+            target_id=policy_id,
+            metadata={
+                "name": normalized_name,
+                "allowed_patterns": allow_list,
+                "denied_patterns": deny_list,
+            },
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM command_policies WHERE id = ?",
+            (policy_id,),
+        ).fetchone()
+        return _row_to_command_policy(row)
+
+
+def list_command_policies(
+    *,
+    search: Optional[str] = None,
+    created_by: Optional[int] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> List[Dict]:
+    _validate_pagination(limit, offset)
+    clauses: List[str] = []
+    params: List[Any] = []
+    if search is not None:
+        if not isinstance(search, str):
+            raise ValidationError("search must be a string")
+        cleaned = f"%{search.lower()}%"
+        clauses.append(
+            "(LOWER(name) LIKE ? OR LOWER(COALESCE(description, '')) LIKE ?)"
+        )
+        params.extend([cleaned, cleaned])
+    if created_by is not None:
+        clauses.append("created_by = ?")
+        params.append(created_by)
+    query = "SELECT * FROM command_policies"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY name ASC"
+    query, params = _apply_pagination(query, params, limit, offset)
+    with get_connection() as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+        return [_row_to_command_policy(row) for row in rows]
+
+
+def get_command_policy(policy_id: int) -> Dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM command_policies WHERE id = ?",
+            (policy_id,),
+        ).fetchone()
+        if not row:
+            raise ValidationError(f"Command policy {policy_id} not found")
+        return _row_to_command_policy(row)
+
+
+def update_command_policy(
+    policy_id: int,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    allowed_patterns: Optional[List[str]] = None,
+    denied_patterns: Optional[List[str]] = None,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    updates: List[str] = []
+    params: List[Any] = []
+    metadata_changes: Dict[str, Any] = {}
+    if name is not None:
+        normalized_name = _require_non_empty_string(name, "name", max_length=120)
+        updates.append("name = ?")
+        params.append(normalized_name)
+        metadata_changes["name"] = normalized_name
+    if description is not None:
+        if description != "" and not isinstance(description, str):
+            raise ValidationError("description must be a string if provided")
+        normalized_description = description.strip() if isinstance(description, str) else None
+        if normalized_description == "":
+            normalized_description = None
+        updates.append("description = ?")
+        params.append(normalized_description)
+        metadata_changes["description"] = normalized_description
+    if allowed_patterns is not None:
+        allow_list = _normalize_command_patterns(allowed_patterns, "allowed_patterns")
+        updates.append("allowed_patterns = ?")
+        params.append(json.dumps(allow_list))
+        metadata_changes["allowed_patterns"] = allow_list
+    if denied_patterns is not None:
+        deny_list = _normalize_command_patterns(denied_patterns, "denied_patterns")
+        updates.append("denied_patterns = ?")
+        params.append(json.dumps(deny_list))
+        metadata_changes["denied_patterns"] = deny_list
+    if not updates:
+        raise ValidationError("No fields provided for update")
+    updates.append("updated_at = ?")
+    now = datetime.now(tz=timezone.utc).isoformat()
+    params.append(now)
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        row = conn.execute(
+            "SELECT * FROM command_policies WHERE id = ?",
+            (policy_id,),
+        ).fetchone()
+        if not row:
+            raise ValidationError(f"Command policy {policy_id} not found")
+        try:
+            conn.execute(
+                f"UPDATE command_policies SET {', '.join(updates)} WHERE id = ?",
+                (*params, policy_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("Command policy name already exists") from exc
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="command_policy.updated",
+            target_type="command_policy",
+            target_id=policy_id,
+            metadata=metadata_changes,
+        )
+        conn.commit()
+        updated = conn.execute(
+            "SELECT * FROM command_policies WHERE id = ?",
+            (policy_id,),
+        ).fetchone()
+        return _row_to_command_policy(updated)
+
+
+def delete_command_policy(policy_id: int, *, performed_by: Optional[int] = None) -> None:
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        row = conn.execute(
+            "SELECT * FROM command_policies WHERE id = ?",
+            (policy_id,),
+        ).fetchone()
+        if not row:
+            raise ValidationError(f"Command policy {policy_id} not found")
+        in_use = conn.execute(
+            "SELECT COUNT(1) FROM authorizations WHERE command_policy_id = ?",
+            (policy_id,),
+        ).fetchone()[0]
+        if in_use:
+            raise ValidationError("Command policy is still assigned to authorizations")
+        conn.execute("DELETE FROM command_policies WHERE id = ?", (policy_id,))
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="command_policy.deleted",
+            target_type="command_policy",
+            target_id=policy_id,
+            metadata={"name": row["name"]},
+        )
+        conn.commit()
+
+
 def create_credential(
     *,
     host_id: int,
@@ -1644,6 +1965,7 @@ def authorize_user(
     access_window_id: Optional[int] = None,
     requires_approval: bool = False,
     source_cidrs: Optional[List[str]] = None,
+    command_policy_id=UNSET,
     performed_by: Optional[int] = None,
 ) -> None:
     if not privileges:
@@ -1651,6 +1973,13 @@ def authorize_user(
     _validate_privileges(privileges)
     normalized_cidrs = _normalize_source_cidrs(source_cidrs)
     cidr_payload = json.dumps(normalized_cidrs)
+    policy_id: Optional[int] = None
+    policy_provided = command_policy_id is not UNSET
+    if policy_provided and command_policy_id is not None:
+        try:
+            policy_id = int(command_policy_id)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("command_policy_id must be an integer") from exc
     with get_connection() as conn:
         actor_id = _ensure_actor(conn, performed_by)
         user = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -1670,6 +1999,10 @@ def authorize_user(
             "SELECT * FROM authorizations WHERE user_id = ? AND host_id = ?",
             (user_id, host_id),
         ).fetchone()
+        if not policy_provided and existing:
+            policy_id = existing["command_policy_id"]
+        if policy_id is not None:
+            _ensure_command_policy(conn, policy_id)
         conn.execute(
             """
             INSERT INTO authorizations (
@@ -1678,14 +2011,16 @@ def authorize_user(
                 privileges,
                 access_window_id,
                 requires_approval,
-                source_cidrs
+                source_cidrs,
+                command_policy_id
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, host_id) DO UPDATE SET
                 privileges = excluded.privileges,
                 access_window_id = excluded.access_window_id,
                 requires_approval = excluded.requires_approval,
-                source_cidrs = excluded.source_cidrs
+                source_cidrs = excluded.source_cidrs,
+                command_policy_id = excluded.command_policy_id
             """,
             (
                 user_id,
@@ -1694,6 +2029,7 @@ def authorize_user(
                 window_id,
                 int(bool(requires_approval)),
                 cidr_payload,
+                policy_id,
             ),
         )
         row = conn.execute(
@@ -1712,6 +2048,7 @@ def authorize_user(
                 "access_window_id": row["access_window_id"],
                 "requires_approval": bool(row["requires_approval"]),
                 "source_cidrs": normalized_cidrs,
+                "command_policy_id": row["command_policy_id"],
             },
         )
         conn.commit()
@@ -1723,12 +2060,13 @@ def list_authorizations(
     host_id: Optional[int] = None,
     access_window_id: Optional[int] = None,
     requires_approval: Optional[bool] = None,
+    command_policy_id: Optional[int] = None,
     limit: Optional[int] = None,
     offset: Optional[int] = None,
 ) -> List[Dict]:
     _validate_pagination(limit, offset)
     with get_connection() as conn:
-        clauses = []
+        clauses: List[str] = []
         params: List[Any] = []
         if user_id is not None:
             clauses.append("user_id = ?")
@@ -1742,10 +2080,13 @@ def list_authorizations(
         if requires_approval is not None:
             clauses.append("requires_approval = ?")
             params.append(int(bool(requires_approval)))
+        if command_policy_id is not None:
+            clauses.append("command_policy_id = ?")
+            params.append(command_policy_id)
+        query = "SELECT * FROM authorizations"
         if clauses:
-            query = "SELECT * FROM authorizations WHERE " + " AND ".join(clauses) + " ORDER BY id ASC"
-        else:
-            query = "SELECT * FROM authorizations ORDER BY id ASC"
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id ASC"
         query, params = _apply_pagination(query, params, limit, offset)
         rows = conn.execute(query, tuple(params)).fetchall()
         return [_row_to_authorization(row) for row in rows]
@@ -2094,7 +2435,14 @@ def revoke_access_request(
         return _row_to_access_request(row)
 
 
-def start_session(*, user_id: int, host_id: int, protocol: str, source_ip: str) -> Dict:
+def start_session(
+    *,
+    user_id: int,
+    host_id: int,
+    protocol: str,
+    source_ip: str,
+    requested_commands: Optional[List[str]] = None,
+) -> Dict:
     if protocol not in SUPPORTED_PROTOCOLS:
         raise ValidationError(f"Unsupported protocol '{protocol}'")
     if not source_ip:
@@ -2103,6 +2451,7 @@ def start_session(*, user_id: int, host_id: int, protocol: str, source_ip: str) 
         client_ip = ipaddress.ip_address(str(source_ip).strip())
     except ValueError as exc:
         raise ValidationError("source_ip must be a valid IPv4 or IPv6 address") from exc
+    normalized_commands = _normalize_requested_commands(requested_commands)
     with get_connection() as conn:
         user_row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         host_row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
@@ -2116,6 +2465,7 @@ def start_session(*, user_id: int, host_id: int, protocol: str, source_ip: str) 
         if protocol == "rdp" and not bool(host_row["rdp_nla"]):
             raise ValidationError("RDP sessions require NLA to be enabled for the host")
         roles = _json_loads(user_row["roles"]) or []
+        command_policy_id: Optional[int] = None
         if ROLE_ADMIN not in roles:
             auth = conn.execute(
                 "SELECT * FROM authorizations WHERE user_id = ? AND host_id = ?",
@@ -2141,26 +2491,39 @@ def start_session(*, user_id: int, host_id: int, protocol: str, source_ip: str) 
                     raise ValidationError(
                         "source_ip is not permitted by the authorization's source_cidrs"
                     )
+            command_policy_id = auth["command_policy_id"]
+            _enforce_command_policy(conn, command_policy_id, normalized_commands)
         started_at = datetime.now(tz=timezone.utc).isoformat()
+        session_metadata: Dict[str, Any] = {}
+        if normalized_commands:
+            session_metadata["requested_commands"] = normalized_commands
+        if command_policy_id is not None:
+            session_metadata["command_policy_id"] = command_policy_id
+        metadata_json = json.dumps(session_metadata) if session_metadata else None
         cursor = conn.execute(
             """
-            INSERT INTO sessions (user_id, host_id, protocol, started_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO sessions (user_id, host_id, protocol, started_at, metadata)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (user_id, host_id, protocol, started_at),
+            (user_id, host_id, protocol, started_at, metadata_json),
         )
         session_id = cursor.lastrowid
+        audit_metadata: Dict[str, Any] = {
+            "host_id": host_id,
+            "protocol": protocol,
+            "source_ip": str(client_ip),
+        }
+        if normalized_commands:
+            audit_metadata["requested_commands"] = normalized_commands
+        if command_policy_id is not None:
+            audit_metadata["command_policy_id"] = command_policy_id
         _record_audit_event(
             conn,
             actor_id=user_id,
             action="session.started",
             target_type="session",
             target_id=session_id,
-            metadata={
-                "host_id": host_id,
-                "protocol": protocol,
-                "source_ip": str(client_ip),
-            },
+            metadata=audit_metadata,
         )
         conn.commit()
         row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()

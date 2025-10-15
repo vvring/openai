@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.12.0")
+app = FastAPI(title="Bastion Management Service", version="0.13.0")
 
 
 def _handle_validation_error(func):
@@ -338,6 +338,98 @@ def remove_host_group_member(
     )
 
 
+@app.post("/command-policies", status_code=status.HTTP_201_CREATED)
+@_handle_validation_error
+def create_command_policy(payload: Dict) -> Dict:
+    allowed = payload.get("allowed_patterns")
+    if allowed is not None and not isinstance(allowed, list):
+        raise ValidationError("allowed_patterns must be provided as a list")
+    denied = payload.get("denied_patterns")
+    if denied is not None and not isinstance(denied, list):
+        raise ValidationError("denied_patterns must be provided as a list")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    return crud.create_command_policy(
+        name=payload.get("name"),
+        description=payload.get("description"),
+        allowed_patterns=allowed,
+        denied_patterns=denied,
+        performed_by=parsed_actor,
+    )
+
+
+@app.get("/command-policies")
+@_handle_validation_error
+def list_command_policies(
+    search: Optional[str] = None,
+    created_by: Optional[str] = None,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
+) -> List[Dict]:
+    parsed_created: Optional[int] = None
+    parsed_limit: Optional[int] = None
+    parsed_offset: Optional[int] = None
+    if created_by is not None:
+        parsed_created = _parse_int(created_by, "created_by")
+    if limit is not None:
+        parsed_limit = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        parsed_offset = _parse_non_negative_int(offset, "offset")
+    return crud.list_command_policies(
+        search=search,
+        created_by=parsed_created,
+        limit=parsed_limit,
+        offset=parsed_offset,
+    )
+
+
+@app.get("/command-policies/{policy_id}")
+@_handle_validation_error
+def get_command_policy(policy_id: str) -> Dict:
+    return crud.get_command_policy(_parse_int(policy_id, "policy_id"))
+
+
+@app.patch("/command-policies/{policy_id}")
+@_handle_validation_error
+def update_command_policy(policy_id: str, payload: Dict) -> Dict:
+    allowed = payload.get("allowed_patterns") if "allowed_patterns" in payload else None
+    if "allowed_patterns" in payload and allowed is not None and not isinstance(allowed, list):
+        raise ValidationError("allowed_patterns must be provided as a list")
+    denied = payload.get("denied_patterns") if "denied_patterns" in payload else None
+    if "denied_patterns" in payload and denied is not None and not isinstance(denied, list):
+        raise ValidationError("denied_patterns must be provided as a list")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    description = payload.get("description") if "description" in payload else None
+    if "description" in payload and description is None:
+        description = ""
+    return crud.update_command_policy(
+        _parse_int(policy_id, "policy_id"),
+        name=payload.get("name"),
+        description=description,
+        allowed_patterns=allowed,
+        denied_patterns=denied,
+        performed_by=parsed_actor,
+    )
+
+
+@app.delete("/command-policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
+@_handle_validation_error
+def delete_command_policy(policy_id: str, performed_by: Optional[str] = None):
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    crud.delete_command_policy(
+        _parse_int(policy_id, "policy_id"),
+        performed_by=parsed_actor,
+    )
+    return None
+
+
 @app.post("/credentials", status_code=status.HTTP_201_CREATED)
 @_handle_validation_error
 def create_credential(payload: Dict) -> Dict:
@@ -526,6 +618,13 @@ def assign_authorization(payload: Dict):
     source_cidrs = payload.get("source_cidrs")
     if source_cidrs is not None and not isinstance(source_cidrs, list):
         raise ValidationError("source_cidrs must be provided as a list")
+    command_policy_value = crud.UNSET
+    if "command_policy_id" in payload:
+        policy_value = payload.get("command_policy_id")
+        if policy_value is not None:
+            command_policy_value = _parse_int(policy_value, "command_policy_id")
+        else:
+            command_policy_value = None
     crud.authorize_user(
         user_id,
         host_id,
@@ -533,6 +632,7 @@ def assign_authorization(payload: Dict):
         access_window_id=parsed_window,
         requires_approval=parsed_requires,
         source_cidrs=source_cidrs,
+        command_policy_id=command_policy_value,
         performed_by=parsed_actor,
     )
     return None
@@ -545,6 +645,7 @@ def list_authorizations(
     host_id: Optional[str] = None,
     access_window_id: Optional[str] = None,
     requires_approval: Optional[str] = None,
+    command_policy_id: Optional[str] = None,
     limit: Optional[str] = None,
     offset: Optional[str] = None,
 ) -> List[Dict]:
@@ -552,6 +653,7 @@ def list_authorizations(
     parsed_host: Optional[int] = None
     parsed_window: Optional[int] = None
     parsed_requires: Optional[bool] = None
+    parsed_policy: Optional[int] = None
     parsed_limit: Optional[int] = None
     parsed_offset: Optional[int] = None
     if user_id is not None:
@@ -562,6 +664,8 @@ def list_authorizations(
         parsed_window = _parse_int(access_window_id, "access_window_id")
     if requires_approval is not None:
         parsed_requires = _parse_bool(requires_approval, "requires_approval")
+    if command_policy_id is not None:
+        parsed_policy = _parse_int(command_policy_id, "command_policy_id")
     if limit is not None:
         parsed_limit = _parse_positive_int(limit, "limit")
     if offset is not None:
@@ -571,6 +675,7 @@ def list_authorizations(
         host_id=parsed_host,
         access_window_id=parsed_window,
         requires_approval=parsed_requires,
+        command_policy_id=parsed_policy,
         limit=parsed_limit,
         offset=parsed_offset,
     )
@@ -674,11 +779,15 @@ def revoke_access_request(request_id: str, payload: Dict) -> Dict:
 @app.post("/sessions", status_code=status.HTTP_201_CREATED)
 @_handle_validation_error
 def start_session(payload: Dict) -> Dict:
+    requested_commands = payload.get("requested_commands")
+    if requested_commands is not None and not isinstance(requested_commands, list):
+        raise ValidationError("requested_commands must be provided as a list")
     return crud.start_session(
         user_id=_parse_int(payload.get("user_id"), "user_id"),
         host_id=_parse_int(payload.get("host_id"), "host_id"),
         protocol=payload.get("protocol"),
         source_ip=payload.get("source_ip"),
+        requested_commands=requested_commands,
     )
 
 

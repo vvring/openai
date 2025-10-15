@@ -44,6 +44,10 @@ def _ensure_authorization_columns(cursor: sqlite3.Cursor) -> None:
             "ALTER TABLE authorizations ADD COLUMN source_cidrs TEXT NOT NULL DEFAULT '[]'"
         )
         cursor.execute("UPDATE authorizations SET source_cidrs = '[]' WHERE source_cidrs IS NULL")
+    if "command_policy_id" not in existing:
+        cursor.execute(
+            "ALTER TABLE authorizations ADD COLUMN command_policy_id INTEGER"
+        )
 
 
 def _ensure_access_request_columns(cursor: sqlite3.Cursor) -> None:
@@ -125,6 +129,21 @@ def init_db() -> None:
         )
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS command_policies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                description TEXT,
+                allowed_patterns TEXT NOT NULL DEFAULT '[]',
+                denied_patterns TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                created_by INTEGER,
+                FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS credentials (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 host_id INTEGER NOT NULL,
@@ -161,9 +180,11 @@ def init_db() -> None:
                 access_window_id INTEGER,
                 requires_approval INTEGER NOT NULL DEFAULT 0,
                 source_cidrs TEXT NOT NULL DEFAULT '[]',
+                command_policy_id INTEGER,
                 UNIQUE(user_id, host_id),
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-                FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE
+                FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE,
+                FOREIGN KEY(command_policy_id) REFERENCES command_policies(id) ON DELETE SET NULL
             )
             """
         )

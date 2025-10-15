@@ -65,6 +65,7 @@ class Authorization:
     access_window_id: Optional[int] = None
     requires_approval: bool = False
     source_cidrs: List[str] = field(default_factory=list)
+    command_policy_id: Optional[int] = None
 
 
 @dataclass(slots=True)
@@ -116,3 +117,15 @@ class AccessRequest:
     expires_at: Optional[datetime]
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(slots=True)
+class CommandPolicy:
+    id: int
+    name: str
+    description: Optional[str]
+    allowed_patterns: List[str] = field(default_factory=list)
+    denied_patterns: List[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_by: Optional[int] = None

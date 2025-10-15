@@ -27,6 +27,7 @@ def fresh_database():
             "access_requests",
             "credentials",
             "authorizations",
+            "command_policies",
             "host_group_members",
             "host_groups",
             "hosts",
@@ -44,6 +45,7 @@ def fresh_database():
             "access_requests",
             "credentials",
             "authorizations",
+            "command_policies",
             "host_group_members",
             "host_groups",
             "hosts",
@@ -454,6 +456,7 @@ def test_authorization_enforcement_and_listing():
     assert len(authorizations) == 1
     assert authorizations[0]["privileges"] == "read"
     assert authorizations[0]["access_window_id"] is None
+    assert authorizations[0]["command_policy_id"] is None
 
     resp = client.get(f"/authorizations?access_window_id=1")
     assert resp.status_code == 200
@@ -576,6 +579,167 @@ def test_authorization_source_cidr_enforcement():
     )
     assert denied_resp.status_code == 400
     assert "source_ip" in denied_resp.json()["detail"]
+
+
+def test_command_policy_lifecycle_and_enforcement():
+    admin_resp = client.post(
+        "/users",
+        json={
+            "username": "policy-admin",
+            "full_name": "Policy Admin",
+            "email": "policy-admin@example.com",
+            "roles": ["admin"],
+        },
+    )
+    assert admin_resp.status_code == 201
+    admin_id = admin_resp.json()["id"]
+
+    operator_resp = client.post(
+        "/users",
+        json={
+            "username": "policy-operator",
+            "full_name": "Policy Operator",
+            "email": "policy-operator@example.com",
+            "roles": ["operator"],
+        },
+    )
+    assert operator_resp.status_code == 201
+    operator_id = operator_resp.json()["id"]
+
+    host_resp = client.post(
+        "/hosts",
+        json={
+            "name": "policy-host",
+            "hostname": "10.0.0.88",
+            "port": 22,
+            "operating_system": "linux",
+            "protocols": ["ssh"],
+            "tls_enabled": True,
+            "rdp_nla": True,
+        },
+    )
+    assert host_resp.status_code == 201
+    host_id = host_resp.json()["id"]
+
+    policy_resp = client.post(
+        "/command-policies",
+        json={
+            "name": "shell-guard",
+            "description": "Protect shell operations",
+            "allowed_patterns": ["sudo *", "ls *"],
+            "denied_patterns": ["rm -rf *", "shutdown*"],
+            "performed_by": admin_id,
+        },
+    )
+    assert policy_resp.status_code == 201, policy_resp.text
+    policy_body = policy_resp.json()
+    policy_id = policy_body["id"]
+    assert "rm -rf *" in policy_body["denied_patterns"]
+
+    assign_resp = client.post(
+        "/authorizations",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "privileges": "read-write",
+            "command_policy_id": policy_id,
+        },
+    )
+    assert assign_resp.status_code == 204, assign_resp.text
+
+    missing_command_resp = client.post(
+        "/sessions",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.50",
+        },
+    )
+    assert missing_command_resp.status_code == 400
+    assert "requested_commands" in missing_command_resp.json()["detail"]
+
+    denied_resp = client.post(
+        "/sessions",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.50",
+            "requested_commands": ["rm -rf /var/tmp"],
+        },
+    )
+    assert denied_resp.status_code == 400
+    assert "violates" in denied_resp.json()["detail"]
+
+    allowed_commands = ["sudo systemctl status sshd"]
+    allowed_resp = client.post(
+        "/sessions",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.50",
+            "requested_commands": allowed_commands,
+        },
+    )
+    assert allowed_resp.status_code == 201, allowed_resp.text
+    session_body = allowed_resp.json()
+    assert session_body["metadata"]["requested_commands"] == allowed_commands
+    assert session_body["metadata"]["command_policy_id"] == policy_id
+
+    list_resp = client.get("/command-policies")
+    assert list_resp.status_code == 200
+    assert len(list_resp.json()) == 1
+
+    filtered_resp = client.get(f"/command-policies?created_by={admin_id}")
+    assert filtered_resp.status_code == 200
+    assert len(filtered_resp.json()) == 1
+
+    update_resp = client.patch(
+        f"/command-policies/{policy_id}",
+        json={
+            "allowed_patterns": ["sudo *", "ls *", "cat *"],
+            "performed_by": admin_id,
+        },
+    )
+    assert update_resp.status_code == 200
+    assert "cat *" in update_resp.json()["allowed_patterns"]
+
+    delete_blocked = client.delete(f"/command-policies/{policy_id}")
+    assert delete_blocked.status_code == 400
+    assert "assigned" in delete_blocked.json()["detail"]
+
+    remove_policy_resp = client.post(
+        "/authorizations",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "privileges": "read-write",
+            "command_policy_id": None,
+        },
+    )
+    assert remove_policy_resp.status_code == 204
+
+    no_policy_session = client.post(
+        "/sessions",
+        json={
+            "user_id": operator_id,
+            "host_id": host_id,
+            "protocol": "ssh",
+            "source_ip": "198.51.100.51",
+        },
+    )
+    assert no_policy_session.status_code == 201, no_policy_session.text
+
+    delete_resp = client.delete(
+        f"/command-policies/{policy_id}?performed_by={admin_id}"
+    )
+    assert delete_resp.status_code == 204, delete_resp.text
+
+    final_list = client.get("/command-policies")
+    assert final_list.status_code == 200
+    assert final_list.json() == []
 
 
 def test_protocol_and_nla_enforcement():
