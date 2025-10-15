@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from . import crud
 from .crud import ValidationError
 
-app = FastAPI(title="Bastion Management Service", version="0.8.0")
+app = FastAPI(title="Bastion Management Service", version="0.9.0")
 
 
 def _handle_validation_error(func):
@@ -214,6 +214,126 @@ def update_host(host_id: str, payload: Dict) -> Dict:
         tags=tags,
         environment=payload.get("environment"),
         business_unit=payload.get("business_unit"),
+        performed_by=parsed_actor,
+    )
+
+
+@app.post("/host-groups", status_code=status.HTTP_201_CREATED)
+@_handle_validation_error
+def create_host_group(payload: Dict) -> Dict:
+    host_ids = payload.get("host_ids")
+    if host_ids is not None and not isinstance(host_ids, list):
+        raise ValidationError("host_ids must be provided as a list")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    return crud.create_host_group(
+        name=payload.get("name"),
+        description=payload.get("description"),
+        host_ids=host_ids,
+        performed_by=parsed_actor,
+    )
+
+
+@app.get("/host-groups")
+@_handle_validation_error
+def list_host_groups(
+    host_id: Optional[str] = None,
+    search: Optional[str] = None,
+    include_hosts: Optional[str] = None,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
+) -> List[Dict]:
+    parsed_host: Optional[int] = None
+    parsed_limit: Optional[int] = None
+    parsed_offset: Optional[int] = None
+    include_details = False
+    if host_id is not None:
+        parsed_host = _parse_int(host_id, "host_id")
+    if include_hosts is not None:
+        include_details = _parse_bool(include_hosts, "include_hosts")
+    if limit is not None:
+        parsed_limit = _parse_positive_int(limit, "limit")
+    if offset is not None:
+        parsed_offset = _parse_non_negative_int(offset, "offset")
+    return crud.list_host_groups(
+        host_id=parsed_host,
+        search=search,
+        include_hosts=include_details,
+        limit=parsed_limit,
+        offset=parsed_offset,
+    )
+
+
+@app.get("/host-groups/{group_id}")
+@_handle_validation_error
+def get_host_group(group_id: str, include_hosts: Optional[str] = None) -> Dict:
+    include_details = False
+    if include_hosts is not None:
+        include_details = _parse_bool(include_hosts, "include_hosts")
+    return crud.get_host_group(
+        _parse_int(group_id, "group_id"), include_hosts=include_details
+    )
+
+
+@app.patch("/host-groups/{group_id}")
+@_handle_validation_error
+def update_host_group(group_id: str, payload: Dict) -> Dict:
+    if "host_ids" in payload:
+        raise ValidationError("host_ids must be managed via membership endpoints")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    return crud.update_host_group(
+        _parse_int(group_id, "group_id"),
+        name=payload.get("name"),
+        description=payload.get("description"),
+        performed_by=parsed_actor,
+    )
+
+
+@app.delete("/host-groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
+@_handle_validation_error
+def delete_host_group(group_id: str, performed_by: Optional[str] = None):
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    crud.delete_host_group(
+        _parse_int(group_id, "group_id"), performed_by=parsed_actor
+    )
+    return None
+
+
+@app.post("/host-groups/{group_id}/hosts")
+@_handle_validation_error
+def add_host_group_member(group_id: str, payload: Dict) -> Dict:
+    host_id = payload.get("host_id")
+    if host_id is None:
+        raise ValidationError("host_id is required")
+    performed_by = payload.get("performed_by")
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    return crud.add_host_to_group(
+        group_id=_parse_int(group_id, "group_id"),
+        host_id=_parse_int(host_id, "host_id"),
+        performed_by=parsed_actor,
+    )
+
+
+@app.delete("/host-groups/{group_id}/hosts/{host_id}")
+@_handle_validation_error
+def remove_host_group_member(
+    group_id: str, host_id: str, performed_by: Optional[str] = None
+) -> Dict:
+    parsed_actor: Optional[int] = None
+    if performed_by is not None:
+        parsed_actor = _parse_int(performed_by, "performed_by")
+    return crud.remove_host_from_group(
+        group_id=_parse_int(group_id, "group_id"),
+        host_id=_parse_int(host_id, "host_id"),
         performed_by=parsed_actor,
     )
 

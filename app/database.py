@@ -72,6 +72,26 @@ def init_db() -> None:
         _ensure_host_columns(cursor)
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS host_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                description TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS host_group_members (
+                group_id INTEGER NOT NULL,
+                host_id INTEGER NOT NULL,
+                PRIMARY KEY (group_id, host_id),
+                FOREIGN KEY(group_id) REFERENCES host_groups(id) ON DELETE CASCADE,
+                FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS authorizations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,

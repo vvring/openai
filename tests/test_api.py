@@ -25,6 +25,8 @@ def fresh_database():
             "recordings",
             "sessions",
             "authorizations",
+            "host_group_members",
+            "host_groups",
             "hosts",
             "users",
             "access_windows",
@@ -38,6 +40,8 @@ def fresh_database():
             "recordings",
             "sessions",
             "authorizations",
+            "host_group_members",
+            "host_groups",
             "hosts",
             "users",
             "access_windows",
@@ -125,6 +129,126 @@ def test_user_host_flow():
     resp = client.get("/sessions")
     assert resp.status_code == 200
     assert len(resp.json()) >= 1
+
+
+def test_host_group_lifecycle():
+    admin_resp = client.post(
+        "/users",
+        json={
+            "username": "group-admin",
+            "full_name": "Group Admin",
+            "email": "group-admin@example.com",
+            "roles": ["admin"],
+        },
+    )
+    assert admin_resp.status_code == 201, admin_resp.text
+    admin_id = admin_resp.json()["id"]
+
+    first_host_resp = client.post(
+        "/hosts",
+        json={
+            "name": "db-01",
+            "hostname": "10.1.0.10",
+            "port": 22,
+            "operating_system": "linux",
+            "protocols": ["ssh"],
+            "tls_enabled": True,
+            "rdp_nla": False,
+            "performed_by": admin_id,
+        },
+    )
+    assert first_host_resp.status_code == 201, first_host_resp.text
+    first_host = first_host_resp.json()
+
+    second_host_resp = client.post(
+        "/hosts",
+        json={
+            "name": "db-02",
+            "hostname": "10.1.0.11",
+            "port": 22,
+            "operating_system": "linux",
+            "protocols": ["ssh"],
+            "tls_enabled": True,
+            "rdp_nla": False,
+            "performed_by": admin_id,
+        },
+    )
+    assert second_host_resp.status_code == 201, second_host_resp.text
+    second_host = second_host_resp.json()
+
+    create_group_resp = client.post(
+        "/host-groups",
+        json={
+            "name": "Database Servers",
+            "description": "Primary database cluster",
+            "host_ids": [first_host["id"]],
+            "performed_by": admin_id,
+        },
+    )
+    assert create_group_resp.status_code == 201, create_group_resp.text
+    group = create_group_resp.json()
+    assert group["host_ids"] == [first_host["id"]]
+    assert group["name"] == "Database Servers"
+
+    host_detail = client.get(f"/hosts/{first_host['id']}")
+    assert host_detail.status_code == 200
+    assert host_detail.json()["groups"][0]["name"] == "Database Servers"
+
+    list_resp = client.get("/host-groups?include_hosts=true")
+    assert list_resp.status_code == 200
+    groups = list_resp.json()
+    assert groups[0]["hosts"][0]["id"] == first_host["id"]
+
+    add_member_resp = client.post(
+        f"/host-groups/{group['id']}/hosts",
+        json={"host_id": second_host["id"], "performed_by": admin_id},
+    )
+    assert add_member_resp.status_code == 200, add_member_resp.text
+    updated_group = add_member_resp.json()
+    assert sorted(updated_group["host_ids"]) == sorted(
+        [first_host["id"], second_host["id"]]
+    )
+
+    detail_resp = client.get(f"/host-groups/{group['id']}?include_hosts=true")
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert {host["id"] for host in detail["hosts"]} == {
+        first_host["id"],
+        second_host["id"],
+    }
+    for host in detail["hosts"]:
+        assert any(g["id"] == group["id"] for g in host["groups"])
+
+    filter_resp = client.get(f"/host-groups?host_id={second_host['id']}")
+    assert filter_resp.status_code == 200
+    assert len(filter_resp.json()) == 1
+
+    patch_resp = client.patch(
+        f"/host-groups/{group['id']}",
+        json={"name": "DB Production", "performed_by": admin_id},
+    )
+    assert patch_resp.status_code == 200, patch_resp.text
+    assert patch_resp.json()["name"] == "DB Production"
+
+    removal_resp = client.delete(
+        f"/host-groups/{group['id']}/hosts/{first_host['id']}?performed_by={admin_id}"
+    )
+    assert removal_resp.status_code == 200, removal_resp.text
+    removal_body = removal_resp.json()
+    assert first_host["id"] not in removal_body["host_ids"]
+
+    refreshed_host = client.get(f"/hosts/{first_host['id']}")
+    assert refreshed_host.status_code == 200
+    assert refreshed_host.json()["groups"] == []
+
+    delete_resp = client.delete(
+        f"/host-groups/{group['id']}?performed_by={admin_id}"
+    )
+    assert delete_resp.status_code == 204, delete_resp.text
+
+    final_list = client.get("/host-groups")
+    assert final_list.status_code == 200
+    assert final_list.json() == []
 
 
 def test_authorization_enforcement_and_listing():

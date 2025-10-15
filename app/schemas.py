@@ -32,6 +32,14 @@ class Host:
 
 
 @dataclass(slots=True)
+class HostGroup:
+    id: int
+    name: str
+    description: Optional[str] = None
+    host_ids: List[int] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class Authorization:
     id: int
     user_id: int

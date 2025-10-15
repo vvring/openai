@@ -41,7 +41,7 @@ def _row_to_user(row) -> Dict:
     }
 
 
-def _row_to_host(row) -> Dict:
+def _row_to_host(row, *, groups: Optional[List[Dict]] = None) -> Dict:
     protocols = _json_loads(row["protocols"])
     columns = set(row.keys())
     tags = _json_loads(row["tags"]) if "tags" in columns else None
@@ -57,6 +57,24 @@ def _row_to_host(row) -> Dict:
         "tags": tags if isinstance(tags, list) else [],
         "environment": row["environment"] if "environment" in columns else None,
         "business_unit": row["business_unit"] if "business_unit" in columns else None,
+        "groups": groups if groups is not None else [],
+    }
+
+
+def _row_to_host_group(row, *, host_ids: Optional[List[int]] = None) -> Dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "description": row["description"],
+        "host_ids": host_ids if host_ids is not None else [],
+    }
+
+
+def _row_to_host_group_summary(row) -> Dict:
+    return {
+        "id": row["group_id"] if "group_id" in row.keys() else row["id"],
+        "name": row["name"],
+        "description": row["description"],
     }
 
 
@@ -164,6 +182,81 @@ def _validate_roles(roles: List[str]) -> None:
     for role in roles:
         if role not in allowed:
             raise ValidationError(f"Unsupported role '{role}'")
+
+
+def _map_host_groups(conn: sqlite3.Connection, host_ids: List[int]) -> Dict[int, List[Dict]]:
+    if not host_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(host_ids))
+    rows = conn.execute(
+        f"""
+        SELECT
+            hgm.host_id AS host_id,
+            hg.id AS group_id,
+            hg.name AS name,
+            hg.description AS description
+        FROM host_group_members hgm
+        JOIN host_groups hg ON hgm.group_id = hg.id
+        WHERE hgm.host_id IN ({placeholders})
+        ORDER BY hg.name ASC
+        """,
+        tuple(host_ids),
+    ).fetchall()
+    mapping: Dict[int, List[Dict]] = {host_id: [] for host_id in host_ids}
+    for row in rows:
+        mapping.setdefault(row["host_id"], []).append(_row_to_host_group_summary(row))
+    return mapping
+
+
+def _get_group_host_ids(conn: sqlite3.Connection, group_id: int) -> List[int]:
+    rows = conn.execute(
+        "SELECT host_id FROM host_group_members WHERE group_id = ? ORDER BY host_id ASC",
+        (group_id,),
+    ).fetchall()
+    return [row["host_id"] for row in rows]
+
+
+def _fetch_hosts_for_group(conn: sqlite3.Connection, group_id: int) -> List[Dict]:
+    host_rows = conn.execute(
+        """
+        SELECT h.*
+        FROM host_group_members hgm
+        JOIN hosts h ON hgm.host_id = h.id
+        WHERE hgm.group_id = ?
+        ORDER BY h.name ASC
+        """,
+        (group_id,),
+    ).fetchall()
+    host_ids = [row["id"] for row in host_rows]
+    groups_map = _map_host_groups(conn, host_ids)
+    return [_row_to_host(row, groups=groups_map.get(row["id"], [])) for row in host_rows]
+
+
+def _normalize_host_ids(host_ids: Optional[List[int]]) -> List[int]:
+    if host_ids is None:
+        return []
+    if not isinstance(host_ids, list):
+        raise ValidationError("host_ids must be provided as a list")
+    normalized: List[int] = []
+    seen = set()
+    for value in host_ids:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("host_ids must contain integers") from exc
+        if parsed <= 0:
+            raise ValidationError("host_ids must reference positive identifiers")
+        if parsed not in seen:
+            normalized.append(parsed)
+            seen.add(parsed)
+    return normalized
+
+
+def _ensure_host_group(conn: sqlite3.Connection, group_id: int):
+    row = conn.execute("SELECT * FROM host_groups WHERE id = ?", (group_id,)).fetchone()
+    if not row:
+        raise ValidationError(f"Host group {group_id} not found")
+    return row
 
 
 def _validate_protocols(protocols: List[str]) -> None:
@@ -747,7 +840,7 @@ def create_host(
         )
         conn.commit()
         row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
-        return _row_to_host(row)
+        return _row_to_host(row, groups=[])
 
 
 def list_hosts(
@@ -765,7 +858,11 @@ def list_hosts(
     _validate_environment(environment)
     with get_connection() as conn:
         rows = conn.execute("SELECT * FROM hosts ORDER BY id ASC").fetchall()
-        hosts = [_row_to_host(row) for row in rows]
+        host_ids = [row["id"] for row in rows]
+        groups_map = _map_host_groups(conn, host_ids)
+        hosts = [
+            _row_to_host(row, groups=groups_map.get(row["id"], [])) for row in rows
+        ]
     if environment is not None:
         hosts = [host for host in hosts if host["environment"] == environment]
     if protocol is not None:
@@ -791,7 +888,8 @@ def get_host(host_id: int) -> Dict:
         row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
         if not row:
             raise ValidationError(f"Host {host_id} not found")
-        return _row_to_host(row)
+        groups_map = _map_host_groups(conn, [host_id])
+        return _row_to_host(row, groups=groups_map.get(host_id, []))
 
 
 def update_host(
@@ -895,7 +993,229 @@ def update_host(
         )
         conn.commit()
         row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
-        return _row_to_host(row)
+        groups_map = _map_host_groups(conn, [host_id])
+        return _row_to_host(row, groups=groups_map.get(host_id, []))
+
+
+def create_host_group(
+    *,
+    name: str,
+    description: Optional[str] = None,
+    host_ids: Optional[List[int]] = None,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    if not name or not isinstance(name, str):
+        raise ValidationError("name is required")
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise ValidationError("name must not be empty")
+    if len(normalized_name) > 120:
+        raise ValidationError("name cannot exceed 120 characters")
+    if description is not None and description != "" and not isinstance(description, str):
+        raise ValidationError("description must be a string if provided")
+    host_id_list = _normalize_host_ids(host_ids)
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        for host_id in host_id_list:
+            exists = conn.execute(
+                "SELECT id FROM hosts WHERE id = ?",
+                (host_id,),
+            ).fetchone()
+            if not exists:
+                raise ValidationError(f"Host {host_id} not found")
+        try:
+            cursor = conn.execute(
+                "INSERT INTO host_groups (name, description) VALUES (?, ?)",
+                (normalized_name, description.strip() if isinstance(description, str) else None),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("Host group already exists") from exc
+        group_id = cursor.lastrowid
+        for host_id in host_id_list:
+            conn.execute(
+                "INSERT OR IGNORE INTO host_group_members (group_id, host_id) VALUES (?, ?)",
+                (group_id, host_id),
+            )
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="host_group.created",
+            target_type="host_group",
+            target_id=group_id,
+            metadata={"name": normalized_name, "host_ids": host_id_list},
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM host_groups WHERE id = ?", (group_id,)).fetchone()
+        host_ids_result = _get_group_host_ids(conn, group_id)
+        return _row_to_host_group(row, host_ids=host_ids_result)
+
+
+def list_host_groups(
+    *,
+    host_id: Optional[int] = None,
+    search: Optional[str] = None,
+    include_hosts: bool = False,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> List[Dict]:
+    _validate_pagination(limit, offset)
+    with get_connection() as conn:
+        clauses: List[str] = []
+        params: List[Any] = []
+        query = "SELECT DISTINCT hg.* FROM host_groups hg"
+        if host_id is not None:
+            query += " JOIN host_group_members hgm ON hg.id = hgm.group_id"
+            clauses.append("hgm.host_id = ?")
+            params.append(host_id)
+        if search is not None:
+            if not isinstance(search, str):
+                raise ValidationError("search must be a string")
+            like = f"%{search.lower()}%"
+            clauses.append("(LOWER(hg.name) LIKE ? OR LOWER(COALESCE(hg.description, '')) LIKE ?)")
+            params.extend([like, like])
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY hg.name ASC"
+        query, params = _apply_pagination(query, params, limit, offset)
+        rows = conn.execute(query, tuple(params)).fetchall()
+        groups: List[Dict] = []
+        for row in rows:
+            host_ids_for_group = _get_group_host_ids(conn, row["id"])
+            payload = _row_to_host_group(row, host_ids=host_ids_for_group)
+            if include_hosts:
+                payload["hosts"] = _fetch_hosts_for_group(conn, row["id"])
+            groups.append(payload)
+        return groups
+
+
+def get_host_group(group_id: int, *, include_hosts: bool = False) -> Dict:
+    with get_connection() as conn:
+        row = _ensure_host_group(conn, group_id)
+        host_ids = _get_group_host_ids(conn, group_id)
+        payload = _row_to_host_group(row, host_ids=host_ids)
+        if include_hosts:
+            payload["hosts"] = _fetch_hosts_for_group(conn, group_id)
+        return payload
+
+
+def update_host_group(
+    group_id: int,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    performed_by: Optional[int] = None,
+) -> Dict:
+    updates: List[str] = []
+    params: List[Any] = []
+    changes: Dict[str, Any] = {}
+    if name is not None:
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError("name must be a non-empty string")
+        if len(name.strip()) > 120:
+            raise ValidationError("name cannot exceed 120 characters")
+        updates.append("name = ?")
+        params.append(name.strip())
+        changes["name"] = name.strip()
+    if description is not None:
+        if description != "" and not isinstance(description, str):
+            raise ValidationError("description must be a string if provided")
+        cleaned = description.strip() if isinstance(description, str) else None
+        updates.append("description = ?")
+        params.append(cleaned)
+        changes["description"] = cleaned
+    if not updates:
+        raise ValidationError("No fields provided for update")
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        _ensure_host_group(conn, group_id)
+        try:
+            conn.execute(
+                f"UPDATE host_groups SET {', '.join(updates)} WHERE id = ?",
+                (*params, group_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("Host group already exists") from exc
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="host_group.updated",
+            target_type="host_group",
+            target_id=group_id,
+            metadata=changes,
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM host_groups WHERE id = ?", (group_id,)).fetchone()
+        host_ids = _get_group_host_ids(conn, group_id)
+        return _row_to_host_group(row, host_ids=host_ids)
+
+
+def delete_host_group(group_id: int, *, performed_by: Optional[int] = None) -> None:
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        row = _ensure_host_group(conn, group_id)
+        conn.execute("DELETE FROM host_groups WHERE id = ?", (group_id,))
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="host_group.deleted",
+            target_type="host_group",
+            target_id=group_id,
+            metadata={"name": row["name"]},
+        )
+        conn.commit()
+
+
+def add_host_to_group(
+    *, group_id: int, host_id: int, performed_by: Optional[int] = None
+) -> Dict:
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        group_row = _ensure_host_group(conn, group_id)
+        host_row = conn.execute("SELECT * FROM hosts WHERE id = ?", (host_id,)).fetchone()
+        if not host_row:
+            raise ValidationError(f"Host {host_id} not found")
+        conn.execute(
+            "INSERT OR IGNORE INTO host_group_members (group_id, host_id) VALUES (?, ?)",
+            (group_id, host_id),
+        )
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="host_group.host_added",
+            target_type="host_group",
+            target_id=group_id,
+            metadata={"host_id": host_id},
+        )
+        conn.commit()
+        host_ids = _get_group_host_ids(conn, group_id)
+        payload = _row_to_host_group(group_row, host_ids=host_ids)
+        payload["hosts"] = _fetch_hosts_for_group(conn, group_id)
+        return payload
+
+
+def remove_host_from_group(
+    *, group_id: int, host_id: int, performed_by: Optional[int] = None
+) -> Dict:
+    with get_connection() as conn:
+        actor_id = _ensure_actor(conn, performed_by)
+        group_row = _ensure_host_group(conn, group_id)
+        conn.execute(
+            "DELETE FROM host_group_members WHERE group_id = ? AND host_id = ?",
+            (group_id, host_id),
+        )
+        _record_audit_event(
+            conn,
+            actor_id=actor_id,
+            action="host_group.host_removed",
+            target_type="host_group",
+            target_id=group_id,
+            metadata={"host_id": host_id},
+        )
+        conn.commit()
+        host_ids = _get_group_host_ids(conn, group_id)
+        payload = _row_to_host_group(group_row, host_ids=host_ids)
+        payload["hosts"] = _fetch_hosts_for_group(conn, group_id)
+        return payload
 
 
 def authorize_user(
